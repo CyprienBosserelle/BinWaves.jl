@@ -1,7 +1,5 @@
-# Micro-benchmarks of the hot paths.   julia -t 1 bench.jl [path_to_dir_with_WaveAction.jl_and_WaveSweep.jl]
-dir = length(ARGS) > 0 ? ARGS[1] : @__DIR__
-include(joinpath(dir, "WaveAction.jl")); include(joinpath(dir, "WaveSweep.jl"))
-using .WaveAction, .WaveSweep, Printf
+# Micro-benchmarks of the hot paths.   julia -t 1 --project=benchmark benchmark/bench.jl
+using BinWaves, Printf
 
 function make(; nx = 100, ny = 60, ns = 16, nth = 24, flat = false, sources = false, currents = false)
     dx = 25.0

@@ -1,7 +1,5 @@
-# Tests of the garden-sprinkler-effect alleviation (anisotropic diffusion).   julia -t 4 test_gse.jl
-include(joinpath(@__DIR__, "WaveAction.jl"))
-include(joinpath(@__DIR__, "WaveSweep.jl"))
-using .WaveAction, .WaveSweep
+# Tests of the garden-sprinkler-effect alleviation (anisotropic diffusion).   julia -t 4 --project=. test/runtests.jl
+using BinWaves
 using Test, Printf
 
 # moments of one spectral bin field over the interior

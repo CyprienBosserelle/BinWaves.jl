@@ -2,10 +2,8 @@
 # source. In deep water the stationary solution is purely geometric: the energy at (x,y) is the fraction of the incident
 # directional distribution whose ray (travelling back along -θ) passes through the gap. The discrete direction bins give
 # separated rays (the garden sprinkler effect). Compared with the exact fraction.
-#   julia -t auto gse_stationary_test.jl
-include(joinpath(@__DIR__, "WaveAction.jl"))
-include(joinpath(@__DIR__, "WaveSweep.jl"))
-using .WaveAction, .WaveSweep
+#   julia -t auto --project=examples examples/gse_stationary_test.jl
+using BinWaves
 using Printf
 
 dx = 10e3

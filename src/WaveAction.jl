@@ -23,7 +23,7 @@ Conventions
 
 Quick start
 ```julia
-include("WaveAction.jl"); using .WaveAction
+using BinWaves
 grid  = CartesianGrid(x, y)                       # cell-centre coordinates (uniform)
 model = WaveModel(grid; depth = D)                # D :: Matrix (nx, ny), positive down
 set_boundaries!(model; left = SpectrumBC(Hs = 2.0, Tp = 10.0, dir = 270.0))

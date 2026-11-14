@@ -3,11 +3,10 @@ WaveGPU.jl — GPU (and portable CPU) execution of the WaveAction / WaveSweep wa
 
 The same kernels run on any KernelAbstractions backend: `CUDA.CUDABackend()`, `AMDGPU.ROCBackend()`, `Metal.MetalBackend()`,
 `oneAPI.oneAPIBackend()` or `CPU()` (used for testing here: the sandbox this was written in has no GPU, so the kernels have
-been validated against the CPU solvers on the CPU backend only — see test_gpu.jl).
+been validated against the CPU solvers on the CPU backend only — see the package tests).
 
     using CUDA                                   # or AMDGPU / Metal / oneAPI
-    include("WaveAction.jl"); include("WaveSweep.jl"); include("WaveGPU.jl")
-    using .WaveAction, .WaveSweep, .WaveGPU
+    using BinWaves
 
     m  = WaveModel(...)                           # set up exactly as for the CPU (depth, spectrum, physics, boundaries, wind, GSE)
     gm = gpu_model(m; backend = CUDABackend(), T = Float32)      # uploads everything once (T = Float64 is the default)
@@ -35,8 +34,8 @@ module WaveGPU
 using KernelAbstractions
 import Adapt
 using Printf
-using Main.WaveAction
-using Main.WaveSweep
+using ..WaveAction
+using ..WaveSweep
 
 export GPUModel, gpu_model, to_cpu!, upload_state!, refresh_environment!, refresh_boundaries!,
        step_gpu!, run_gpu!, step_implicit_gpu!, run_implicit_gpu!, solve_stationary_gpu!, bulk_gpu, hs_tm_gpu, total_action_gpu
