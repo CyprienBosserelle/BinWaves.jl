@@ -71,4 +71,9 @@ include("kp.jl")
 export BinWavesKP, build_kp, reconstruct, point_parameters, save_kp, load_kp, bin_offshore_spectrum,
        save_kp_netcdf, load_kp_netcdf
 
+# Local wind sea (non-linear in wind speed: look-up table over wind speed and direction)
+include("windkp.jl")
+
+export WindKP, build_wind_kp, wind_sea, save_wind_kp_netcdf, load_wind_kp_netcdf
+
 end # module BinWaves

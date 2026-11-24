@@ -330,26 +330,43 @@ end
 median_spacing(d) = (s = sort(collect(Float64, d)); sort(diff(s))[(1 + length(s) - 1) ÷ 2])
 
 """
-    reconstruct(kp, E, f, dir; fields = true) -> (; Hs, point_var, V, captured)
+    reconstruct(kp, E, f, dir; fields = true, wind = nothing, U10 = nothing, wdir = nothing) -> (; Hs, point_var, V, captured[, wind])
 
 Nearshore reconstruction for offshore spectra `E[t, f, dir]` (see `bin_offshore_spectrum`).
 * `Hs`         (nx, ny, nt) significant wave height (Float32; 0 on dry cells) — only if `fields = true`
 * `point_var`  (nt, ns, nth, npoints) variance (m²) per model spectral bin at the stored points
 * `V`          the case weights, `captured` the in-range fraction of the offshore variance
 * `depth_limit`  e.g. `0.73`: cap the gridded Hs at `depth_limit · depth` (use with coefficients built *without* breaking, see README)
+
+Local wind sea (semi-enclosed water): pass a `WindKP` from `build_wind_kp` as `wind`, with the local wind time series
+`U10[t]` (m/s) and `wdir[t]` (nautical, coming from, degrees). Its variance is added to the swell (`Hs² = Hs²_swell +
+Hs²_wind`, and the point spectra are summed); `wind_interp` (`:loglog` / `:linear`) and `umin` are passed to `wind_sea`. The
+result then also holds `wind`, the separate wind-sea part (see `wind_sea`).
 """
 function reconstruct(kp::BinWavesKP, E::AbstractArray{<:Real,3}, f::AbstractVector, dir::AbstractVector; fields::Bool = true,
-                     tchunk::Int = 128, depth_limit = nothing)
+                     tchunk::Int = 128, depth_limit = nothing, wind = nothing, U10 = nothing, wdir = nothing,
+                     wind_interp::Symbol = :loglog, umin::Real = 1.0)
     all(kp.done) || @warn "only $(count(kp.done)) of $(length(kp.cases)) cases are computed: the reconstructed energy is incomplete"
     V, captured = bin_offshore_spectrum(kp, E, f, dir)
     nt = size(V, 1); nc = length(kp.cases)
     nx, ny = length(kp.x), length(kp.y)
+    ws = nothing
+    if wind !== nothing
+        wind isa WindKP || error("wind must be a WindKP (from build_wind_kp / load_wind_kp_netcdf)")
+        (U10 === nothing || wdir === nothing) && error("give the local wind time series U10 and wdir with wind")
+        length(U10) == nt && length(wdir) == nt || error("U10 and wdir must have one value per time of E ($nt)")
+        (length(wind.x) == nx && length(wind.y) == ny && wind.x ≈ kp.x && wind.y ≈ kp.y && wind.sig ≈ kp.sig &&
+         wind.dth ≈ kp.dth) || error("the wind table was built on a different grid / spectral grid than the swell coefficients")
+        wind.points == kp.points || error("the wind table and the swell coefficients store spectra at different points")
+        ws = wind_sea(wind, U10, wdir; fields = fields, interp = wind_interp, umin = umin)
+    end
     Hs = fields ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
     if fields
         K = reshape(kp.kp_m0, nc, nx * ny)
         for t0 in 1:tchunk:nt
             r = t0:min(nt, t0 + tchunk - 1)
             m0 = Float32.(V[r, :]) * K                                         # (chunk × cells)
+            ws === nothing || (m0 .+= permutedims(reshape(ws.m0[:, :, r], nx * ny, length(r))))
             Hs[:, :, r] .= reshape(permutedims(4 .* sqrt.(max.(m0, 0f0))), nx, ny, length(r))
             if depth_limit !== nothing            # crude surf-zone cap: Hs ≤ γ d
                 cap = Float32.(depth_limit .* kp.depth)
@@ -359,16 +376,18 @@ function reconstruct(kp::BinWavesKP, E::AbstractArray{<:Real,3}, f::AbstractVect
     end
     ns, nth, np = size(kp.kp_spec, 2), size(kp.kp_spec, 3), size(kp.kp_spec, 4)
     pv = np == 0 ? zeros(nt, ns, nth, 0) : reshape(V * reshape(Float64.(kp.kp_spec), nc, ns * nth * np), nt, ns, nth, np)
-    return (; Hs, point_var = pv, V, captured)
+    ws === nothing && return (; Hs, point_var = pv, V, captured)
+    pv .+= ws.point_var
+    return (; Hs, point_var = pv, V, captured, wind = ws)
 end
 
 """
-    point_parameters(kp, point_var) -> (; Hs, Tm01, Tp, Dir)   each (nt, npoints)
+    point_parameters(kp, point_var) -> (; Hs, Tm01, Tp, Dir)   each (nt, npoints)   (kp: BinWavesKP or WindKP)
 
 Bulk parameters from reconstructed point spectra: Hs = 4√m0, Tm01 = m0/m1, Tp = 1/f at the maximum of the direction-integrated
 density, Dir = vector-mean coming-from direction (nautical, degrees).
 """
-function point_parameters(kp::BinWavesKP, pv::AbstractArray{<:Real,4})
+function point_parameters(kp, pv::AbstractArray{<:Real,4})   # kp: BinWavesKP or WindKP
     nt, ns, nth, np = size(pv)
     sig, dsig, dth = kp.sig, kp.dsig, kp.dth
     f = sig ./ 2π
