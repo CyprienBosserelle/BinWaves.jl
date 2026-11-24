@@ -38,8 +38,13 @@ struct WindKP
     info::Dict{String,Any}
 end
 Base.show(io::IO, k::WindKP) = print(io, "WindKP: ", count(k.done), "/", length(k.done), " runs computed (", length(k.dirs),
-    " directions × ", length(k.speeds), " speeds ", round.(k.speeds; digits = 2), " m/s), grid ", length(k.x), "×", length(k.y),
-    ", ", length(k.points), " spectral points")
+    " directions × ", length(k.speeds), " speeds ", round.(k.speeds; digits = 2), " m/s), ",
+    _hasmesh(k.info) ? "block mesh of $(size(k.m0, 3)) cells" : "grid $(length(k.x))×$(length(k.y))", ", ", length(k.points), " spectral points")
+
+_getwind(m::WaveModel) = (copy(m.env.u10x), copy(m.env.u10y))
+_getwind(m::BlockModel) = [_getwind(b) for b in m.blocks]
+_setwind!(m::WaveModel, w) = (m.env.u10x .= w[1]; m.env.u10y .= w[2]; m)
+_setwind!(m::BlockModel, w) = (foreach(_setwind!, m.blocks, w); m)
 
 _with(p::WaveParams; kw...) = WaveParams(; (f => (haskey(kw, f) ? kw[f] : getfield(p, f)) for f in fieldnames(WaveParams))...)
 
@@ -48,11 +53,12 @@ _with(p::WaveParams; kw...) = WaveParams(; (f => (haskey(kw, f) ? kw[f] : getfie
 # ------------------------------------------------------------------------------------------------------------
 function _create_wkp_nc(file::AbstractString, wk::WindKP; compress::Int = 1)
     isfile(file) && rm(file)
-    nx, ny, ns, nth, nd, nu, np = length(wk.x), length(wk.y), length(wk.sig), round(Int, 2π / wk.dth), length(wk.dirs),
+    nx, ny, ns, nth, nd, nu, np = size(wk.m0, 3), size(wk.m0, 4), length(wk.sig), round(Int, 2π / wk.dth), length(wk.dirs),
                                   length(wk.speeds), length(wk.points)
+    dX, xv, dY, yv = _xydims(wk.info, wk.x, wk.y)
     fill0 = Dict{String,Any}("_FillValue" => 0f0)
     dirs_bin = [mod(270 - rad2deg((k - 1) * wk.dth), 360) for k in 1:nth]
-    nccreate(file, "depth", "x", wk.x, Dict("units" => "m"), "y", wk.y, Dict("units" => "m"); atts = Dict("units" => "m"),
+    nccreate(file, "depth", dX, xv, Dict("units" => "m"), dY, yv, Dict("units" => "m"); atts = Dict("units" => "m"),
              t = NC_DOUBLE, compress = compress)
     nccreate(file, "sig", "freq", wk.sig ./ 2π, Dict("units" => "Hz"); atts = Dict("units" => "rad s-1"), t = NC_DOUBLE)
     nccreate(file, "dsig", "freq", ns; atts = Dict("units" => "rad s-1"), t = NC_DOUBLE)
@@ -63,7 +69,7 @@ function _create_wkp_nc(file::AbstractString, wk::WindKP; compress::Int = 1)
              t = NC_DOUBLE)
     nccreate(file, "wind_speed", "wspd", wk.speeds, Dict("units" => "m s-1", "long_name" => "trained wind speed U10"); t = NC_DOUBLE)
     nccreate(file, "run_done", "wdir", nd, "wspd", nu; atts = Dict("long_name" => "1 when the run has been computed"), t = NC_INT)
-    nccreate(file, "m0", "x", nx, "y", ny, "wdir", nd, "wspd", nu;
+    nccreate(file, "m0", dX, nx, dY, ny, "wdir", nd, "wspd", nu;
              atts = merge(fill0, Dict("long_name" => "wind-sea variance m0", "units" => "m2")), t = NC_FLOAT, compress = compress)
     if np > 0
         nccreate(file, "point_i", "point", np; t = NC_INT); nccreate(file, "point_j", "point", np; t = NC_INT)
@@ -71,7 +77,8 @@ function _create_wkp_nc(file::AbstractString, wk::WindKP; compress::Int = 1)
                  atts = merge(fill0, Dict("long_name" => "wind-sea variance per spectral bin", "units" => "m2")),
                  t = NC_FLOAT, compress = compress)
     end
-    ncwrite(wk.x, file, "x"); ncwrite(wk.y, file, "y"); ncwrite(wk.depth, file, "depth")
+    ncwrite(xv, file, dX); ncwrite(yv, file, dY); ncwrite(wk.depth, file, "depth")
+    _hasmesh(wk.info) && _nc_write_mesh!(file, wk.info["mesh"], wk.x, wk.y)
     ncwrite(wk.sig, file, "sig"); ncwrite(wk.dsig, file, "dsig"); ncwrite(wk.sigf, file, "sigf"); ncwrite([wk.dth], file, "dth")
     ncwrite(dirs_bin, file, "dir_from"); ncwrite(wk.dirs, file, "wind_dir"); ncwrite(wk.speeds, file, "wind_speed")
     if np > 0
@@ -86,7 +93,7 @@ function _create_wkp_nc(file::AbstractString, wk::WindKP; compress::Int = 1)
 end
 
 function _write_runs!(file::AbstractString, wk::WindKP, idx)
-    nx, ny, ns, nth, np = length(wk.x), length(wk.y), length(wk.sig), round(Int, 2π / wk.dth), length(wk.points)
+    nx, ny, ns, nth, np = size(wk.m0, 3), size(wk.m0, 4), length(wk.sig), round(Int, 2π / wk.dth), length(wk.points)
     for (a, b) in idx
         ncwrite(reshape(wk.m0[a, b, :, :], nx, ny, 1, 1), file, "m0"; start = [1, 1, a, b], count = [nx, ny, 1, 1])
         np > 0 && ncwrite(reshape(wk.spec[a, b, :, :, :], ns, nth, np, 1, 1), file, "spec";
@@ -115,7 +122,9 @@ Read a file written by `save_wind_kp_netcdf` or by `build_wind_kp(...; checkpoin
 function load_wind_kp_netcdf(file::AbstractString)
     isfile(file) || error("no such file: $file")
     rd(v) = ncread(file, v)
-    x, y, depth = Float64.(rd("x")), Float64.(rd("y")), Float64.(rd("depth"))
+    mr = _nc_read_mesh(file)
+    x, y = mr === nothing ? (Float64.(rd("x")), Float64.(rd("y"))) : (mr[2], mr[3])
+    depth = Float64.(rd("depth"))
     sig, dsig, sigf, dth = Float64.(rd("sig")), Float64.(rd("dsig")), Float64.(rd("sigf")), Float64(rd("dth")[1])
     dirs, speeds = Float64.(rd("wind_dir")), Float64.(rd("wind_speed"))
     nd, nu = length(dirs), length(speeds)
@@ -131,6 +140,7 @@ function load_wind_kp_netcdf(file::AbstractString)
     ga = NetCDF.open(file) do nc_; Dict{String,Any}(nc_.gatts); end
     info = Dict{String,Any}("seconds" => Float64(get(ga, "seconds", 0.0)), "whitecap" => get(ga, "whitecap", 1) != 0,
                             "breaking" => get(ga, "breaking", 0) != 0, "friction" => get(ga, "friction", 0) != 0)
+    mr === nothing || (info["mesh"] = mr[1])
     wk = WindKP(x, y, depth, sig, dsig, sigf, dth, dirs, speeds, m0, pts, spec, done, info)
     all(done) || @warn "$file holds $(count(done))/$(length(done)) wind runs; finish it with build_wind_kp(...; checkpoint=\"$file\")"
     return wk
@@ -167,14 +177,16 @@ wind field and parameters are restored afterwards.
             wind's slowly growing sea "converges" early (measured: half the converged Hs at 5 m/s).
 * `checkpoint`  NetCDF file updated every `checkpoint_every` runs; an existing file is resumed (`resume = true`).
 
-The same `points` as the swell `build_kp` must be used to add the point spectra in `reconstruct`.
+The same `points` as the swell `build_kp` must be used to add the point spectra in `reconstruct`. Works on a block mesh
+(`BlockModel`) as `build_kp` does (fields over the mesh cells, points as `(x, y)` coordinates).
 """
-function build_wind_kp(m::WaveModel; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0],
+function build_wind_kp(m::Union{WaveModel,BlockModel}; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0],
                        points = Tuple{Int,Int}[], whitecap::Bool = true,
                        sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0, dabs = 1e-4, maxiter = 200), verbose::Bool = true,
                        checkpoint = nothing, checkpoint_every::Int = 10, resume::Bool = true)
-    sp, g = m.spec, m.grid
-    ns, nth, nx, ny = sp.ns, sp.nth, g.nx, g.ny
+    sp = m.spec
+    ns, nth = sp.ns, sp.nth
+    nx, ny = _fieldsize(m)
     dirv = sort(unique(mod.(collect(Float64, dirs), 360.0)))
     spdv = sort(unique(collect(Float64, speeds)))
     isempty(dirv) && error("give at least one wind direction")
@@ -182,15 +194,15 @@ function build_wind_kp(m::WaveModel; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 1
     first(spdv) > 0.1 || error("wind speeds must be > 0.1 m/s (the model switches wind input off below that)")
     whitecap || m.params.whitecap ||
         @warn "build_wind_kp with whitecapping off: the stationary wind sea is only bounded by breaking / friction / fetch"
-    for (i, j) in points
-        (1 <= i <= nx && 1 <= j <= ny) || error("point ($i,$j) outside the grid")
-    end
+    points = _resolve_points(m, points)
     nd, nu, npt = length(dirv), length(spdv), length(points)
-    D = m.env.d[NGH+1:NGH+nx, NGH+1:NGH+ny]
+    D = _depthfield(m)
     p_run = _with(m.params; wind = true, whitecap = whitecap || m.params.whitecap)
     info = Dict{String,Any}("seconds" => 0.0, "whitecap" => p_run.whitecap, "breaking" => p_run.breaking,
                             "friction" => p_run.friction)
-    wk = WindKP(copy(g.x), copy(g.y), copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, dirv, spdv,
+    _meshinfo!(info, m)
+    xg, yg = _coords(m)
+    wk = WindKP(xg, yg, copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, dirv, spdv,
                 zeros(Float32, nd, nu, nx, ny), collect(points), zeros(Float32, nd, nu, ns, nth, npt), fill(false, nd, nu), info)
     t_prev = 0.0
     if checkpoint !== nothing
@@ -205,7 +217,7 @@ function build_wind_kp(m::WaveModel; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 1
         end
     end
     orig_p, orig_bc = m.params, m.bc
-    orig_u, orig_v = copy(m.env.u10x), copy(m.env.u10y)
+    orig_w = _getwind(m)
     pending = Tuple{Int,Int}[]
     t0 = time()
     flush_ck!() = if checkpoint !== nothing && !isempty(pending)
@@ -222,16 +234,9 @@ function build_wind_kp(m::WaveModel; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 1
             set_wind!(m; U10 = spdv[b], dir = dirv[a])
             it, conv = solve_stationary!(m; sweep = sweep, verbose = false)
             conv || @warn @sprintf("wind run (%.1f°, %.1f m/s) did not converge in %d iterations", dirv[a], spdv[b], it)
-            for j in 1:ny, i in 1:nx
-                m.env.wet[NGH+i, NGH+j] || continue
-                s = 0.0
-                for it_ in 1:nth, is in 1:ns
-                    s += sp.sig[is] * m.N[is, it_, NGH+i, NGH+j] * sp.dsig[is]
-                end
-                wk.m0[a, b, i, j] = s * sp.dth
-            end
-            for (q, (i, j)) in enumerate(points), it_ in 1:nth, is in 1:ns
-                wk.spec[a, b, is, it_, q] = sp.sig[is] * m.N[is, it_, NGH+i, NGH+j] * sp.dsig[is] * sp.dth
+            _m0!(view(wk.m0, a, b, :, :), m, 1.0)
+            for (q, pt) in enumerate(points)
+                _binvar!(view(wk.spec, a, b, :, :, q), m, pt, 1.0)
             end
             wk.done[a, b] = true
             push!(pending, (a, b))
@@ -246,7 +251,7 @@ function build_wind_kp(m::WaveModel; dirs = 0:22.5:337.5, speeds = [5.0, 10.0, 1
         flush_ck!()
         m.params = orig_p
         set_boundaries!(m; left = orig_bc[1], right = orig_bc[2], bottom = orig_bc[3], top = orig_bc[4])
-        m.env.u10x .= orig_u; m.env.u10y .= orig_v
+        _setwind!(m, orig_w)
     end
     info["seconds"] = t_prev + (time() - t0)
     checkpoint === nothing || ncputatt(checkpoint, "NC_GLOBAL", Dict{String,Any}("seconds" => info["seconds"]))
@@ -325,7 +330,7 @@ function wind_sea(wk::WindKP, U10::AbstractVector, dir::AbstractVector; fields::
     interp in (:loglog, :linear) || error("interp must be :loglog or :linear")
     nt = length(U10); length(dir) == nt || error("U10 and dir must have the same length")
     all(wk.done) || @warn "only $(count(wk.done)) of $(length(wk.done)) wind runs are computed: the wind sea is incomplete"
-    nx, ny = length(wk.x), length(wk.y)
+    nx, ny = size(wk.m0, 3), size(wk.m0, 4)
     ns, nth, np = size(wk.spec, 3), size(wk.spec, 4), size(wk.spec, 5)
     m0 = fields ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
     pv = zeros(nt, ns, nth, np)
@@ -360,3 +365,6 @@ function wind_sea(wk::WindKP, U10::AbstractVector, dir::AbstractVector; fields::
     Hs = fields ? 4 .* sqrt.(max.(m0, 0f0)) : zeros(Float32, 0, 0, 0)
     return (; m0, Hs, point_var = pv)
 end
+
+WaveBlocks.to_grid(wk::WindKP, v::AbstractArray, xg::AbstractVector, yg::AbstractVector; outside = NaN) =
+    _hasmesh(wk.info) ? to_grid(wk.info["mesh"], v, xg, yg; outside = outside) : v

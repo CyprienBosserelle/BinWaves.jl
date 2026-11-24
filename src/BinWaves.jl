@@ -24,7 +24,7 @@ Differences from the paper's set-up (all by design, to suit this model):
   * Linearity: exact for refraction, shoaling and the (linear) JONSWAP bottom friction; approximate when depth-induced
     breaking is on (non-linear in wave height) — as in the paper, where cases use Hs = 1 m — and when wind input is on.
 
-    using BinWaves                 # brings WaveAction, WaveSweep and WaveGPU exports into scope
+    using BinWaves                 # brings WaveAction, WaveSweep, WaveBlocks and WaveGPU exports into scope
 
     kp = build_kp(model; points = [(40, 20)], sides = (:left, :bottom))        # slow part, once
     rec = reconstruct(kp, E, f_hz, dir_nautical_from_deg)                       # fast part, per offshore time series
@@ -44,23 +44,28 @@ using NetCDF
 # Core solvers (submodules)
 include("WaveAction.jl")   # explicit spectral wave action solver
 include("WaveSweep.jl")    # implicit / stationary four-sweep solver
+include("WaveBlocks.jl")   # block-adaptive (quadtree) meshes for both solvers
 include("WaveGPU.jl")      # KernelAbstractions (GPU / portable CPU) backend
 
 using .WaveAction
 using .WaveSweep
+using .WaveBlocks
 using .WaveGPU
 
 # Submodules, for qualified access to internals (e.g. `WaveAction.NG`)
-export WaveAction, WaveSweep, WaveGPU
+export WaveAction, WaveSweep, WaveBlocks, WaveGPU
 
 # Re-export the public API of the submodules
-export CartesianGrid, SpectralGrid, WaveParams, WaveModel, SpectrumBC, OpenBC, ZeroBC
+export CartesianGrid, SpectralGrid, WaveParams, WaveModel, SpectrumBC, OpenBC, ZeroBC, ExternalBC
 export set_boundaries!, initialize!, set_environment!, update_environment!, set_wind!
 export GSEParams, set_gse!, gse_step!
 export step!, run!, stable_dt, bulk, total_action, jonswap, wavenumber, wavekin
 export naut2math, math2naut
 
 export SweepParams, four_sweeps!, step_implicit!, run_implicit!, solve_stationary!, hs_tm
+
+export BlockMesh, refine!, refine_by_depth!, balance!, nblocks, ncells, block_bounds, block_dx, cell_centres, cell_dx,
+       cell_index, locate, grid_index, to_grid, bilinear, BlockModel, cell_depth, cell_wet, mesh_summary
 
 export GPUModel, gpu_model, to_cpu!, upload_state!, refresh_environment!, refresh_boundaries!,
        step_gpu!, run_gpu!, step_implicit_gpu!, run_implicit_gpu!, solve_stationary_gpu!, bulk_gpu, hs_tm_gpu, total_action_gpu

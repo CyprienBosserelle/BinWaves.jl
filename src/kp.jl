@@ -2,6 +2,111 @@
 
 const NGH = WaveAction.NG
 
+# ------------------------------------------------------------------------------------------------------------
+# Model interface: a regular-grid `WaveModel` or a block-mesh `BlockModel`.
+#   regular grid: fields are (nx, ny), points are grid indices (i, j) or (x, y) coordinates (nearest cell)
+#   block mesh:   fields are (ncells, 1) in `cell_index` order, points are (x, y) coordinates, stored as (block, cell in block)
+# ------------------------------------------------------------------------------------------------------------
+_fieldsize(m::WaveModel) = (m.grid.nx, m.grid.ny)
+_fieldsize(m::BlockModel) = (ncells(m), 1)
+_coords(m::WaveModel) = (copy(m.grid.x), copy(m.grid.y))
+_coords(m::BlockModel) = cell_centres(m.mesh)
+_depthfield(m::WaveModel) = m.env.d[NGH+1:NGH+m.grid.nx, NGH+1:NGH+m.grid.ny]
+_depthfield(m::BlockModel) = reshape(cell_depth(m), :, 1)
+_meshinfo!(info, m::WaveModel) = info
+_meshinfo!(info, m::BlockModel) = (info["mesh"] = deepcopy(m.mesh); info)
+
+function _resolve_points(m::WaveModel, points)
+    out = Tuple{Int,Int}[]
+    nx, ny = m.grid.nx, m.grid.ny
+    for p in points
+        if p[1] isa Integer && p[2] isa Integer
+            i, j = Int(p[1]), Int(p[2])
+        else
+            i = argmin(abs.(m.grid.x .- p[1])); j = argmin(abs.(m.grid.y .- p[2]))
+        end
+        (1 <= i <= nx && 1 <= j <= ny) || error("point ($i,$j) outside the grid")
+        push!(out, (i, j))
+    end
+    return out
+end
+function _resolve_points(m::BlockModel, points)
+    out = Tuple{Int,Int}[]
+    for p in points
+        (p[1] isa Integer && p[2] isa Integer) && error("on a block mesh give the points as (x, y) coordinates (Float64), got $p")
+        r = locate(m.mesh, p[1], p[2])
+        r === nothing && error("point $p is outside the mesh")
+        k, i, j = r
+        push!(out, (k, (j - 1) * m.mesh.bs + i))
+    end
+    return out
+end
+
+"""Variance m0 (m²) of every cell times `scale` into `out` (fieldsize); dry cells get 0."""
+function _m0!(out::AbstractMatrix, m::WaveModel, scale)
+    sp = m.spec
+    for j in 1:m.grid.ny, i in 1:m.grid.nx
+        out[i, j] = m.env.wet[NGH+i, NGH+j] ? _cellm0(m, sp, NGH + i, NGH + j) * scale : 0.0
+    end
+    return out
+end
+function _m0!(out::AbstractMatrix, m::BlockModel, scale)
+    sp, bs = m.spec, m.mesh.bs
+    for (k, b) in enumerate(m.blocks), j in 1:bs, i in 1:bs
+        out[cell_index(m.mesh, k, i, j), 1] = b.env.wet[NGH+i, NGH+j] ? _cellm0(b, sp, NGH + i, NGH + j) * scale : 0.0
+    end
+    return out
+end
+function _cellm0(b::WaveModel, sp, ig, jg)
+    s = 0.0
+    @inbounds for it in 1:sp.nth, is in 1:sp.ns
+        s += sp.sig[is] * b.N[is, it, ig, jg] * sp.dsig[is]
+    end
+    return s * sp.dth
+end
+
+"""Variance per spectral bin (ns, nth) at a stored point, times `scale`."""
+_binvar!(out, m::WaveModel, p, scale) = _binvar!(out, m, m.spec, p[1] + NGH, p[2] + NGH, scale)
+function _binvar!(out, m::BlockModel, p, scale)
+    bs = m.mesh.bs
+    k, c = p
+    return _binvar!(out, m.blocks[k], m.spec, (c - 1) % bs + 1 + NGH, (c - 1) ÷ bs + 1 + NGH, scale)
+end
+function _binvar!(out, b::WaveModel, sp, ig, jg, scale)
+    for it in 1:sp.nth, is in 1:sp.ns
+        out[is, it] = sp.sig[is] * b.N[is, it, ig, jg] * sp.dsig[is] * sp.dth * scale
+    end
+    return out
+end
+
+# ---- mesh in NetCDF files ----
+_hasmesh(info) = haskey(info, "mesh")
+# dimension names / coordinate values of the field dimensions
+_xydims(info, x, y) = _hasmesh(info) ? ("cell", collect(1.0:length(x)), "one", [1.0]) : ("x", x, "y", y)
+
+function _nc_write_mesh!(file, mesh::BlockMesh, x, y)
+    nccreate(file, "cell_x", "cell", length(x); atts = Dict("units" => "m", "long_name" => "cell centre x"), t = NC_DOUBLE)
+    nccreate(file, "cell_y", "cell", length(y); atts = Dict("units" => "m", "long_name" => "cell centre y"), t = NC_DOUBLE)
+    nb = nblocks(mesh)
+    for v in ("mesh_level", "mesh_bx", "mesh_by")
+        nccreate(file, v, "block", nb; t = NC_INT)
+    end
+    ncwrite(Float64.(x), file, "cell_x"); ncwrite(Float64.(y), file, "cell_y")
+    ncwrite(Int32.(mesh.level), file, "mesh_level"); ncwrite(Int32.(mesh.bx), file, "mesh_bx"); ncwrite(Int32.(mesh.by), file, "mesh_by")
+    ncputatt(file, "NC_GLOBAL", Dict{String,Any}("mesh_x0" => mesh.x0, "mesh_y0" => mesh.y0, "mesh_dx0" => mesh.dx0,
+        "mesh_bs" => Int32(mesh.bs), "mesh_nbx" => Int32(mesh.nbx), "mesh_nby" => Int32(mesh.nby), "mesh_maxlevel" => Int32(mesh.maxlevel),
+        "mesh_note" => "block-adaptive mesh: fields are on dimension 'cell' (block by block, i fastest); see BinWaves.WaveBlocks"))
+end
+function _nc_read_mesh(file)
+    has = NetCDF.open(file) do nc_; haskey(nc_.vars, "mesh_level"); end
+    has || return nothing
+    ga = NetCDF.open(file) do nc_; Dict{String,Any}(nc_.gatts); end
+    rd(v) = Int.(ncread(file, v))
+    mesh = BlockMesh(ga["mesh_x0"], ga["mesh_y0"], ga["mesh_dx0"], ga["mesh_bs"], ga["mesh_nbx"], ga["mesh_nby"], ga["mesh_maxlevel"],
+                     rd("mesh_level"), rd("mesh_bx"), rd("mesh_by"))
+    return mesh, Float64.(ncread(file, "cell_x")), Float64.(ncread(file, "cell_y"))
+end
+
 struct BinWavesKP
     x::Vector{Float64}
     y::Vector{Float64}
@@ -21,7 +126,8 @@ struct BinWavesKP
     info::Dict{String,Any}
 end
 Base.show(io::IO, k::BinWavesKP) = print(io, "BinWavesKP: ", count(k.done), "/", length(k.cases), " cases computed (", length(k.fgroups), " freq groups × ",
-    length(k.dgroups), " dir groups), grid ", length(k.x), "×", length(k.y), ", ", length(k.points), " spectral points")
+    length(k.dgroups), " dir groups), ", _hasmesh(k.info) ? "block mesh of $(size(k.kp_m0, 2)) cells" : "grid $(length(k.x))×$(length(k.y))",
+    ", ", length(k.points), " spectral points")
 
 save_kp(file, kp::BinWavesKP) = serialize(file, kp)
 load_kp(file) = deserialize(file)
@@ -35,12 +141,13 @@ _nth(kp::BinWavesKP) = round(Int, 2π / kp.dth)
 """Create an empty KP file with the right shape (unwritten cases read back as 0)."""
 function _create_kp_nc(file::AbstractString, kp::BinWavesKP; compress::Int = 1)
     isfile(file) && rm(file)
-    nx, ny, ns, nth, nc, np = length(kp.x), length(kp.y), length(kp.sig), _nth(kp), length(kp.cases), length(kp.points)
+    nx, ny, ns, nth, nc, np = size(kp.kp_m0, 2), size(kp.kp_m0, 3), length(kp.sig), _nth(kp), length(kp.cases), length(kp.points)
+    dX, xv, dY, yv = _xydims(kp.info, kp.x, kp.y)
     fill0 = Dict{String,Any}("_FillValue" => 0f0)
     xa = Dict("units" => "m"); fa = Dict("units" => "Hz", "long_name" => "model frequency bin centres")
     da = Dict("units" => "degree", "long_name" => "model direction bins, nautical coming-from")
     dirs = [mod(270 - rad2deg((k - 1) * kp.dth), 360) for k in 1:nth]
-    nccreate(file, "depth", "x", kp.x, xa, "y", kp.y, Dict("units" => "m"); atts = Dict("units" => "m"), t = NC_DOUBLE, compress = compress)
+    nccreate(file, "depth", dX, xv, xa, dY, yv, Dict("units" => "m"); atts = Dict("units" => "m"), t = NC_DOUBLE, compress = compress)
     nccreate(file, "sig", "freq", kp.sig ./ 2π, fa; atts = Dict("units" => "rad s-1", "long_name" => "angular frequency of the bin"), t = NC_DOUBLE)
     nccreate(file, "dsig", "freq", ns; atts = Dict("units" => "rad s-1", "long_name" => "bin width"), t = NC_DOUBLE)
     nccreate(file, "sigf", "freq_face", ns + 1; atts = Dict("units" => "rad s-1", "long_name" => "bin faces"), t = NC_DOUBLE)
@@ -52,7 +159,7 @@ function _create_kp_nc(file::AbstractString, kp::BinWavesKP; compress::Int = 1)
     nccreate(file, "case_fgroup", "case", nc; t = NC_INT); nccreate(file, "case_dgroup", "case", nc; t = NC_INT)
     nccreate(file, "case_done", "case", nc; atts = Dict("long_name" => "1 when the case has been computed"), t = NC_INT)
     nccreate(file, "Vin", "case", nc; atts = Dict("units" => "m2", "long_name" => "input variance of the case"), t = NC_DOUBLE)
-    nccreate(file, "kp_m0", "x", nx, "y", ny, "case", nc;
+    nccreate(file, "kp_m0", dX, nx, dY, ny, "case", nc;
              atts = merge(fill0, Dict("long_name" => "output m0 / input variance", "units" => "1")), t = NC_FLOAT, compress = compress)
     if np > 0
         nccreate(file, "point_i", "point", np; t = NC_INT); nccreate(file, "point_j", "point", np; t = NC_INT)
@@ -61,7 +168,8 @@ function _create_kp_nc(file::AbstractString, kp::BinWavesKP; compress::Int = 1)
                  t = NC_FLOAT, compress = compress)
     end
     # static content
-    ncwrite(kp.x, file, "x"); ncwrite(kp.y, file, "y"); ncwrite(kp.depth, file, "depth")
+    ncwrite(xv, file, dX); ncwrite(yv, file, dY); ncwrite(kp.depth, file, "depth")
+    _hasmesh(kp.info) && _nc_write_mesh!(file, kp.info["mesh"], kp.x, kp.y)
     ncwrite(kp.sig, file, "sig"); ncwrite(kp.dsig, file, "dsig"); ncwrite(kp.sigf, file, "sigf"); ncwrite([kp.dth], file, "dth")
     ncwrite(dirs, file, "dir_from")
     ncwrite(Int32.(first.(kp.fgroups)), file, "fgroup_first"); ncwrite(Int32.(last.(kp.fgroups)), file, "fgroup_last")
@@ -84,7 +192,7 @@ Dates_now() = Base.Libc.strftime("%Y-%m-%d %H:%M:%S", time())
 
 """Write the listed cases (data, Vin, done flag) into an existing KP file."""
 function _write_cases!(file::AbstractString, kp::BinWavesKP, idx)
-    nx, ny, ns, nth, np = length(kp.x), length(kp.y), length(kp.sig), _nth(kp), length(kp.points)
+    nx, ny, ns, nth, np = size(kp.kp_m0, 2), size(kp.kp_m0, 3), length(kp.sig), _nth(kp), length(kp.points)
     for c in idx
         ncwrite(reshape(Float32.(kp.kp_m0[c, :, :]), nx, ny, 1), file, "kp_m0"; start = [1, 1, c], count = [nx, ny, 1])
         np > 0 && ncwrite(reshape(Float32.(kp.kp_spec[c, :, :, :]), ns, nth, np, 1), file, "kp_spec";
@@ -116,13 +224,15 @@ Cases that were not finished are flagged in `kp.done` (and `reconstruct` warns a
 function load_kp_netcdf(file::AbstractString)
     isfile(file) || error("no such file: $file")
     rd(v) = ncread(file, v)
-    x, y, depth = Float64.(rd("x")), Float64.(rd("y")), Float64.(rd("depth"))
+    mr = _nc_read_mesh(file)
+    x, y = mr === nothing ? (Float64.(rd("x")), Float64.(rd("y"))) : (mr[2], mr[3])
+    depth = Float64.(rd("depth"))
     sig = Float64.(rd("sig"))
     dsig, sigf, dth = Float64.(rd("dsig")), Float64.(rd("sigf")), Float64(rd("dth")[1])
     fg = [Int(a):Int(b) for (a, b) in zip(rd("fgroup_first"), rd("fgroup_last"))]
     dg = [collect(Int(a):Int(a) + Int(l) - 1) for (a, l) in zip(rd("dgroup_first"), rd("dgroup_len"))]
     cases = [(Int(a), Int(b)) for (a, b) in zip(rd("case_fgroup"), rd("case_dgroup"))]
-    nc = length(cases); nx, ny = length(x), length(y)
+    nc = length(cases)
     done = Int.(rd("case_done")) .== 1                 # unwritten entries carry the NetCDF fill value
     kp_m0 = permutedims(Float32.(rd("kp_m0")), (3, 1, 2))
     haspts = NetCDF.open(file) do nc_; haskey(nc_.vars, "kp_spec"); end
@@ -138,6 +248,7 @@ function load_kp_netcdf(file::AbstractString)
                             "seconds" => Float64(get(ga, "seconds", 0.0)), "refraction" => get(ga, "refraction", 1) != 0,
                             "breaking" => get(ga, "breaking", 0) != 0, "friction" => get(ga, "friction", 0) != 0,
                             "wind" => get(ga, "wind", 0) != 0)
+    mr === nothing || (info["mesh"] = mr[1])
     Vin = Float64.(rd("Vin")); Vin[.!done] .= 0.0
     kp = BinWavesKP(x, y, depth, sig, dsig, sigf, dth, fg, dg, cases, Vin, kp_m0, pts, kp_spec, done, info)
     all(kp.done) || @warn "$file holds $(count(done))/$nc cases; reconstruct will warn until build_kp(...; checkpoint=\"$file\") has finished the rest"
@@ -171,37 +282,40 @@ they are; the model's own boundary conditions are restored afterwards).
             which is non-linear (measured: 4.5 % error in superposed Hs with 0.5, 0.02 % with 0). The price is more numerical
             directional diffusion, so use a fine `nth` and run your direct comparisons with the same settings.
 * `sides`   boundaries that carry the case spectrum; the others get `ZeroBC()`.
-* `points`  grid indices `(i, j)` where the full nearshore spectrum is stored.
+* `points`  where the full nearshore spectrum is stored: grid indices `(i, j)` or `(x, y)` coordinates (nearest cell). On a
+            block mesh (`BlockModel`) give `(x, y)` coordinates; the fields are then vectors over the mesh cells (`(ncells, 1)`,
+            see `cell_centres` and `to_grid`) and the mesh is kept in `kp.info["mesh"]`.
 * `checkpoint`  path of a NetCDF file that is updated every `checkpoint_every` cases (and at the end). If it already exists and
             `resume = true` (default) the finished cases are read from it and skipped, so an interrupted build continues where
             it stopped. The file can be loaded with `load_kp_netcdf` at any time. Settings must match (error otherwise).
 * `cases`   optional vector of case numbers to compute (for testing / restarts); other cases stay zero.
 """
-function build_kp(m::WaveModel; fgroup::Int = 1, dgroup::Int = 1, sides = (:left, :right, :bottom, :top),
+function build_kp(m::Union{WaveModel,BlockModel}; fgroup::Int = 1, dgroup::Int = 1, sides = (:left, :right, :bottom, :top),
                   hs_rule = T -> T > 5 ? 1.0 : 0.1, points = Tuple{Int,Int}[], sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0), verbose::Bool = true,
                   cases = nothing, checkpoint = nothing, checkpoint_every::Int = 10, resume::Bool = true)
-    sp, g = m.spec, m.grid
-    ns, nth, nx, ny = sp.ns, sp.nth, g.nx, g.ny
+    sp = m.spec
+    ns, nth = sp.ns, sp.nth
+    nx, ny = _fieldsize(m)
     nth % dgroup == 0 || error("nth = $nth is not a multiple of dgroup = $dgroup")
     fgroups = [i:min(i + fgroup - 1, ns) for i in 1:fgroup:ns]
     dgroups = [collect(h*dgroup+1:(h+1)*dgroup) for h in 0:(nth÷dgroup-1)]
     caselist = [(a, b) for a in eachindex(fgroups) for b in eachindex(dgroups)]
     nc = length(caselist)
     run_these = cases === nothing ? (1:nc) : cases
-    for (i, j) in points
-        (1 <= i <= nx && 1 <= j <= ny) || error("point ($i,$j) outside the grid")
-    end
+    points = _resolve_points(m, points)
     npt = length(points)
     Vin = zeros(nc)
     kp_m0 = zeros(Float32, nc, nx, ny)
     kp_spec = zeros(Float32, nc, ns, nth, npt)
     done = fill(false, nc)
     orig = m.bc
-    D = m.env.d[NGH+1:NGH+nx, NGH+1:NGH+ny]
+    D = _depthfield(m)
     info = Dict{String,Any}("sides" => collect(sides), "fgroup" => fgroup, "dgroup" => dgroup, "seconds" => 0.0,
                             "refraction" => m.params.refraction, "breaking" => m.params.breaking, "friction" => m.params.friction,
                             "wind" => m.params.wind)
-    kp = BinWavesKP(copy(g.x), copy(g.y), copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, fgroups, dgroups, caselist,
+    _meshinfo!(info, m)
+    xg, yg = _coords(m)
+    kp = BinWavesKP(xg, yg, copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, fgroups, dgroups, caselist,
                     Vin, kp_m0, collect(points), kp_spec, done, info)
     t_prev = 0.0
     if checkpoint !== nothing
@@ -245,16 +359,9 @@ function build_kp(m::WaveModel; fgroup::Int = 1, dgroup::Int = 1, sides = (:left
         swc = SweepParams(w_theta = sweep.w_theta, w_sigma = sweep.w_sigma, iters = sweep.iters, maxiter = sweep.maxiter,
                           drel = sweep.drel, dabs = sweep.dabs * Hs_in, npnts = sweep.npnts)
         solve_stationary!(m; sweep = swc, verbose = false)
-        for j in 1:ny, i in 1:nx
-            m.env.wet[NGH+i, NGH+j] || continue
-            s = 0.0
-            for it in 1:nth, is in 1:ns
-                s += sp.sig[is] * m.N[is, it, NGH+i, NGH+j] * sp.dsig[is]
-            end
-            kp_m0[c, i, j] = s * sp.dth / V
-        end
-        for (p, (i, j)) in enumerate(points), it in 1:nth, is in 1:ns
-            kp_spec[c, is, it, p] = sp.sig[is] * m.N[is, it, NGH+i, NGH+j] * sp.dsig[is] * sp.dth / V
+        _m0!(view(kp_m0, c, :, :), m, 1 / V)
+        for (p, pt) in enumerate(points)
+            _binvar!(view(kp_spec, c, :, :, p), m, pt, 1 / V)
         end
         done[c] = true
         push!(pending, c)
@@ -333,7 +440,8 @@ median_spacing(d) = (s = sort(collect(Float64, d)); sort(diff(s))[(1 + length(s)
     reconstruct(kp, E, f, dir; fields = true, wind = nothing, U10 = nothing, wdir = nothing) -> (; Hs, point_var, V, captured[, wind])
 
 Nearshore reconstruction for offshore spectra `E[t, f, dir]` (see `bin_offshore_spectrum`).
-* `Hs`         (nx, ny, nt) significant wave height (Float32; 0 on dry cells) — only if `fields = true`
+* `Hs`         (nx, ny, nt) significant wave height (Float32; 0 on dry cells) — only if `fields = true`; on a block mesh
+               (ncells, 1, nt): `to_grid(kp, rec.Hs, xg, yg)` samples it onto a regular grid
 * `point_var`  (nt, ns, nth, npoints) variance (m²) per model spectral bin at the stored points
 * `V`          the case weights, `captured` the in-range fraction of the offshore variance
 * `depth_limit`  e.g. `0.73`: cap the gridded Hs at `depth_limit · depth` (use with coefficients built *without* breaking, see README)
@@ -349,13 +457,13 @@ function reconstruct(kp::BinWavesKP, E::AbstractArray{<:Real,3}, f::AbstractVect
     all(kp.done) || @warn "only $(count(kp.done)) of $(length(kp.cases)) cases are computed: the reconstructed energy is incomplete"
     V, captured = bin_offshore_spectrum(kp, E, f, dir)
     nt = size(V, 1); nc = length(kp.cases)
-    nx, ny = length(kp.x), length(kp.y)
+    nx, ny = size(kp.kp_m0, 2), size(kp.kp_m0, 3)
     ws = nothing
     if wind !== nothing
         wind isa WindKP || error("wind must be a WindKP (from build_wind_kp / load_wind_kp_netcdf)")
         (U10 === nothing || wdir === nothing) && error("give the local wind time series U10 and wdir with wind")
         length(U10) == nt && length(wdir) == nt || error("U10 and wdir must have one value per time of E ($nt)")
-        (length(wind.x) == nx && length(wind.y) == ny && wind.x ≈ kp.x && wind.y ≈ kp.y && wind.sig ≈ kp.sig &&
+        (size(wind.m0, 3) == nx && size(wind.m0, 4) == ny && wind.x ≈ kp.x && wind.y ≈ kp.y && wind.sig ≈ kp.sig &&
          wind.dth ≈ kp.dth) || error("the wind table was built on a different grid / spectral grid than the swell coefficients")
         wind.points == kp.points || error("the wind table and the swell coefficients store spectra at different points")
         ws = wind_sea(wind, U10, wdir; fields = fields, interp = wind_interp, umin = umin)
@@ -410,4 +518,15 @@ function point_parameters(kp, pv::AbstractArray{<:Real,4})   # kp: BinWavesKP or
         Dir[t, p] = m0 > 0 ? mod(270 - rad2deg(atan(sy, sx)), 360) : NaN
     end
     return (; Hs, Tm01 = Tm, Tp, Dir)
+end
+
+"""
+    to_grid(kp, v, xg, yg; outside = NaN)
+
+Sample a field of coefficients built on a block mesh (e.g. `reconstruct(...).Hs`, (ncells, 1, nt)) onto the regular grid
+`xg × yg`. For coefficients on a regular grid, `v` is returned unchanged.
+"""
+function WaveBlocks.to_grid(kp::BinWavesKP, v::AbstractArray, xg::AbstractVector, yg::AbstractVector; outside = NaN)
+    _hasmesh(kp.info) || return v
+    return to_grid(kp.info["mesh"], v, xg, yg; outside = outside)
 end
