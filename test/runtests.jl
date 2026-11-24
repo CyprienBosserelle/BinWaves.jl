@@ -5,4 +5,5 @@ using Test
     include("test_gse.jl")
     include("test_windkp.jl")
     include("test_blocks.jl")
+    include("test_output.jl")
 end

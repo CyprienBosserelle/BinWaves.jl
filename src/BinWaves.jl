@@ -65,7 +65,8 @@ export naut2math, math2naut
 export SweepParams, four_sweeps!, step_implicit!, run_implicit!, solve_stationary!, hs_tm
 
 export BlockMesh, refine!, refine_by_depth!, balance!, nblocks, ncells, block_bounds, block_dx, cell_centres, cell_dx,
-       cell_index, locate, grid_index, to_grid, bilinear, BlockModel, cell_depth, cell_wet, mesh_summary
+       cell_index, locate, grid_index, to_grid, interp_stencil, GridStencil, finest_grid, level_grid, bilinear, BlockModel,
+       cell_depth, cell_wet, mesh_summary
 
 export GPUModel, gpu_model, to_cpu!, upload_state!, refresh_environment!, refresh_boundaries!,
        step_gpu!, run_gpu!, step_implicit_gpu!, run_implicit_gpu!, solve_stationary_gpu!, bulk_gpu, hs_tm_gpu, total_action_gpu
@@ -80,5 +81,10 @@ export BinWavesKP, build_kp, reconstruct, point_parameters, save_kp, load_kp, bi
 include("windkp.jl")
 
 export WindKP, build_wind_kp, wind_sea, save_wind_kp_netcdf, load_wind_kp_netcdf
+
+# CF NetCDF output of bulk fields (native block-mesh levels and/or interpolated to the finest level)
+include("output.jl")
+
+export BulkWriter, write_bulk!, write_fields!, save_bulk_netcdf, save_fields_netcdf
 
 end # module BinWaves

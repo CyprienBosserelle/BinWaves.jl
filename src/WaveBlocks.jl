@@ -45,7 +45,8 @@ import ..WaveSweep: solve_stationary!, run_implicit!, step_implicit!, hs_tm, swe
                     make_workspaces
 
 export BlockMesh, refine!, refine_by_depth!, balance!, nblocks, ncells, block_bounds, block_dx, cell_centres, cell_dx,
-       cell_index, locate, grid_index, to_grid, bilinear, BlockModel, cell_depth, cell_wet, mesh_summary
+       cell_index, locate, grid_index, to_grid, interp_stencil, GridStencil, finest_grid, level_grid, bilinear, BlockModel,
+       cell_depth, cell_wet, mesh_summary
 
 # =====================================================================================================================
 # Mesh
@@ -302,6 +303,18 @@ end
 cell_dx(m::BlockMesh) = vcat([fill(block_dx(m, l), m.bs^2) for l in m.level]...)
 
 """
+    level_grid(mesh, l) -> (x, y)
+
+Cell-centre coordinates of the regular grid of refinement level `l` covering the whole domain.
+"""
+function level_grid(m::BlockMesh, l::Integer)
+    h = block_dx(m, l)
+    return ([m.x0 + (i - 0.5) * h for i in 1:(m.nbx * m.bs << l)], [m.y0 + (j - 0.5) * h for j in 1:(m.nby * m.bs << l)])
+end
+"""Cell-centre coordinates of the grid of the finest level present in the mesh."""
+finest_grid(m::BlockMesh) = level_grid(m, maximum(m.level))
+
+"""
     locate(mesh, x, y) -> (k, i, j) or nothing
 
 Block and interior cell containing the point (x, y).
@@ -337,13 +350,18 @@ function grid_index(m::BlockMesh, xg::AbstractVector, yg::AbstractVector)
 end
 
 """
-    to_grid(mesh, v, xg, yg; outside = NaN)   or   to_grid(v, idx::Matrix{Int}; outside = NaN)
+    to_grid(mesh, v, xg, yg; outside = NaN, interp = :nearest)   or   to_grid(v, idx::Matrix{Int}; outside = NaN)
+    to_grid(v, st::GridStencil; outside = NaN)
 
 Sample a cell field `v` (vector over the cells, or array whose first dimension runs over the cells, e.g. (ncells, nt) or
-(ncells, 1, nt)) onto the regular grid `xg × yg` (value of the cell containing each point): result (nxg, nyg, rest...).
+(ncells, 1, nt)) onto the regular grid `xg × yg`: result (nxg, nyg, rest...). `interp = :nearest` takes the value of the cell
+containing each point; `interp = :bilinear` interpolates between cell centres (see `interp_stencil`; NaN values are
+treated as missing). For repeated use build the index / stencil once (`grid_index`, `interp_stencil`).
 """
-to_grid(m::BlockMesh, v::AbstractArray, xg::AbstractVector, yg::AbstractVector; outside = NaN) =
-    to_grid(v, grid_index(m, xg, yg); outside = outside)
+function to_grid(m::BlockMesh, v::AbstractArray, xg::AbstractVector, yg::AbstractVector; outside = NaN, interp::Symbol = :nearest)
+    interp === :nearest && return to_grid(v, grid_index(m, xg, yg); outside = outside)
+    return to_grid(v, interp_stencil(m, xg, yg; method = interp); outside = outside)
+end
 function to_grid(v::AbstractArray, idx::AbstractMatrix{<:Integer}; outside = NaN)
     rest = size(v)[2:end]
     V = reshape(v, size(v, 1), :)
@@ -354,6 +372,95 @@ function to_grid(v::AbstractArray, idx::AbstractMatrix{<:Integer}; outside = NaN
         c > 0 && (out[i, j, t] = V[c, t])
     end
     return reshape(out, size(idx)..., filter(!=(1), collect(rest))...)
+end
+
+"""
+    GridStencil
+
+Interpolation weights from the mesh cells to the points of a regular grid (built by `interp_stencil`).
+"""
+struct GridStencil
+    nx::Int
+    ny::Int
+    own::Vector{Int}          # cell containing each grid point (0 outside the mesh), point index = i + (j-1) nx
+    ptr::Vector{Int}          # contributions of point p: ptr[p] : ptr[p+1]-1
+    cell::Vector{Int}
+    w::Vector{Float64}
+end
+
+"""
+    interp_stencil(mesh, xg, yg; method = :bilinear) -> GridStencil
+
+Weights to interpolate cell values onto the points `xg × yg`. `:bilinear`: bilinear between the four nearest cell centres of
+the level of the cell containing the point; a centre lying in a finer region takes the average of its fine cells, one lying
+in a coarser block takes that coarse cell. At the points of the finest cells' centres this returns the cell values exactly.
+Centres outside the domain are dropped (weights renormalised). `:nearest`: value of the containing cell.
+"""
+function interp_stencil(m::BlockMesh, xg::AbstractVector, yg::AbstractVector; method::Symbol = :bilinear)
+    method in (:bilinear, :nearest) || error("method must be :bilinear or :nearest")
+    nx, ny = length(xg), length(yg)
+    own = zeros(Int, nx * ny); ptr = [1]; cells = Int[]; ws = Float64[]
+    tmp = Tuple{Int,Int,Float64}[]
+    for j in 1:ny, i in 1:nx
+        p = i + (j - 1) * nx
+        r = locate(m, xg[i], yg[j])
+        if r !== nothing
+            k, ci, cj = r
+            own[p] = cell_index(m, k, ci, cj)
+            if method === :nearest
+                push!(cells, own[p]); push!(ws, 1.0)
+            else
+                l = m.level[k]; h = block_dx(m, l)
+                ngx, ngy = m.nbx * m.bs << l, m.nby * m.bs << l
+                fx = (xg[i] - m.x0) / h - 0.5; fy = (yg[j] - m.y0) / h - 0.5
+                i0 = floor(Int, fx); j0 = floor(Int, fy); tx = fx - i0; ty = fy - j0
+                for (a, b, wb) in ((0, 0, (1 - tx) * (1 - ty)), (1, 0, tx * (1 - ty)), (0, 1, (1 - tx) * ty), (1, 1, tx * ty))
+                    wb > 1e-14 || continue
+                    gi, gj = i0 + a, j0 + b
+                    (0 <= gi < ngx && 0 <= gj < ngy) || continue
+                    empty!(tmp)
+                    _sources!(tmp, m, l, gi, gj, wb)
+                    for (kb, lin, ww) in tmp
+                        li = (lin - 1) % (m.bs + 2NG) + 1 - NG; lj = (lin - 1) ÷ (m.bs + 2NG) + 1 - NG
+                        push!(cells, cell_index(m, kb, li, lj)); push!(ws, ww)
+                    end
+                end
+            end
+        end
+        push!(ptr, length(cells) + 1)
+    end
+    return GridStencil(nx, ny, own, ptr, cells, ws)
+end
+
+"""Apply a stencil to the cell values `v` (NaN = missing: renormalised over the others; NaN if the containing cell is NaN)."""
+function _apply!(out::AbstractVector, st::GridStencil, v::AbstractVector, outside)
+    @inbounds for p in eachindex(st.own)
+        c0 = st.own[p]
+        if c0 == 0
+            out[p] = outside; continue
+        end
+        if isnan(v[c0])
+            out[p] = NaN; continue
+        end
+        s = 0.0; sw = 0.0
+        for r in st.ptr[p]:st.ptr[p+1]-1
+            x = v[st.cell[r]]
+            isnan(x) && continue
+            s += st.w[r] * x; sw += st.w[r]
+        end
+        out[p] = sw > 0 ? s / sw : NaN
+    end
+    return out
+end
+
+function to_grid(v::AbstractArray, st::GridStencil; outside = NaN)
+    rest = size(v)[2:end]
+    V = reshape(v, size(v, 1), :)
+    out = zeros(promote_type(Float64, eltype(v)), st.nx * st.ny, size(V, 2))
+    for t in axes(V, 2)
+        _apply!(view(out, :, t), st, Float64.(view(V, :, t)), outside)
+    end
+    return reshape(out, st.nx, st.ny, filter(!=(1), collect(rest))...)
 end
 
 # =====================================================================================================================

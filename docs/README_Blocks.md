@@ -17,7 +17,8 @@ Hs = to_grid(bm.mesh, b.Hs, xg, yg)                      # sample onto any regul
 ```
 `set_boundaries!`, `initialize!`, `set_wind!`, `set_gse!`, `stable_dt`, `total_action`, `hs_tm` work as on a `WaveModel`.
 Cell fields are vectors in `cell_index` order (block by block, i fastest): `cell_centres(mesh)`, `cell_dx(mesh)`,
-`cell_depth(bm)`, `cell_wet(bm)`; `locate(mesh, x, y)` finds a cell, `grid_index` + `to_grid` resample.
+`cell_depth(bm)`, `cell_wet(bm)`; `locate(mesh, x, y)` finds a cell, `grid_index` + `to_grid` resample (`interp = :bilinear`
+for interpolation). For files, see `docs/README_Output.md` (CF NetCDF, native levels or the finest grid).
 
 ## Refinement
 `refine_by_depth!(mesh, depth; resolution, nsub = 2)` splits a block while its cell size is larger than `resolution(d)`, `d`
