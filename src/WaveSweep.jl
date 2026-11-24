@@ -1,7 +1,6 @@
 # WaveSweep.jl : implicit, four-sweep Gauss-Seidel solver for the wave action balance equation.
-# Load AFTER WaveAction.jl, in the same module (normally Main):
-#     include("WaveAction.jl"); include("WaveSweep.jl"); using .WaveAction, .WaveSweep
-isdefined(Main, :WaveAction) || include(joinpath(@__DIR__, "WaveAction.jl"))
+# Submodule of the BinWaves package (loaded after WaveAction):
+#     using BinWaves
 
 """
     WaveSweep

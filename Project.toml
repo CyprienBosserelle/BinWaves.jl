@@ -1,0 +1,27 @@
+name = "BinWaves"
+uuid = "b646010b-64dc-4a80-98ac-da7306232e78"
+authors = ["Cyprien Bosserelle"]
+version = "0.1.0"
+
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+NetCDF = "30363a11-5582-574a-97bb-aa9a979735b9"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+
+[compat]
+Adapt = "3, 4"
+KernelAbstractions = "0.9"
+LinearAlgebra = "1"
+NetCDF = "0.11, 0.12"
+Printf = "1"
+Serialization = "1"
+julia = "1.9"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

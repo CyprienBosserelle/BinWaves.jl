@@ -1,19 +1,17 @@
 # WaveAction.jl – multi-threaded CPU wave action balance solver (Cartesian grid)
 
-Julia port of the BG_Wave GPU engine for local testing. Single file, **no package dependencies** (only `Base.Threads`,
-plus `Test`/`Printf` for the tests). Tested with Julia 1.13.3 (should work on ≥ 1.9).
+Julia port of the BG_Wave GPU engine for local testing. Part of the `BinWaves` package (`src/WaveAction.jl`); the solver itself only uses `Base.Threads`. Tested with Julia 1.13.3 (should work on ≥ 1.9).
 
 ## Run
 ```
-julia -t auto test_wave.jl               # 20 checks, ~1 min
-julia -t auto example_shoal_beach.jl     # shoal + beach demo
+julia -t auto --project=. -e 'using Pkg; Pkg.test()'   # package tests
 ```
 `-t auto` (or `-t 8`) sets the number of threads. Parallelism is shared-memory threading over grid rows; it is not
 `Distributed`/MPI.
 
 ## Use
 ```julia
-include("WaveAction.jl"); using .WaveAction
+using BinWaves
 grid  = CartesianGrid(x, y)                      # cell-centre coordinates, uniform (dx may differ from dy)
 spec  = SpectralGrid(ns = 24, nth = 36, fmin = 0.05, fmax = 0.6)
 model = WaveModel(grid; depth = D, spec = spec,  # D (nx,ny) positive down; or zb = ..., zs = 0.0

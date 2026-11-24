@@ -1,0 +1,7 @@
+[deps]
+BinWaves = "b646010b-64dc-4a80-98ac-da7306232e78"
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[sources]
+BinWaves = {path = ".."}

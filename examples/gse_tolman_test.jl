@@ -2,10 +2,8 @@
 # a Gaussian blob of swell (Hs0 = 2.5 m, sigma_r = 150 km), cos^2 directional distribution about 30°, Gaussian frequency
 # distribution (0.1 ± 0.02 Hz), propagating 5 days in deep water without sources. Directional resolution 15°, γ = 1.1,
 # dx = 100 km. The continuous solution is known in closed form (each (f,θ) component is just translated by cg(f) t).
-#   julia -t auto gse_tolman_test.jl            (writes gse_fields.csv for plotting)
-include(joinpath(@__DIR__, "WaveAction.jl"))
-include(joinpath(@__DIR__, "WaveSweep.jl"))
-using .WaveAction, .WaveSweep
+#   julia -t auto --project=examples examples/gse_tolman_test.jl            (writes gse_fields.csv for plotting)
+using BinWaves
 using Printf, DelimitedFiles
 
 const g = 9.81
