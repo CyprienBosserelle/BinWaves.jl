@@ -18,6 +18,8 @@ Wind-sea look-up table built by `build_wind_kp`: wind-sea variance (m²) for eve
 * `dirs`    trained wind directions (nautical, coming from, degrees, ascending in [0, 360))
 * `speeds`  trained wind speeds U10 (m/s, ascending, > 0)
 * `m0`      (ndir, nspeed, nx, ny) wind-sea m0 (m²; 0 on dry cells)
+* `mc`, `ms` (ndir, nspeed, nx, ny) wind-sea direction vector Σ E cos θ, Σ E sin θ (m²; θ mathematical, propagating-to), for
+            the mean direction and spread of the wind sea (empty (ndir, nspeed, 0, 0) in tables saved before they existed)
 * `spec`    (ndir, nspeed, ns, nth, npoints) wind-sea variance per model spectral bin (m²) at `points`
 * `done`    (ndir, nspeed) which runs have been computed
 """
@@ -32,6 +34,8 @@ struct WindKP
     dirs::Vector{Float64}
     speeds::Vector{Float64}
     m0::Array{Float32,4}
+    mc::Array{Float32,4}
+    ms::Array{Float32,4}
     points::Vector{Tuple{Int,Int}}
     spec::Array{Float32,5}
     done::Matrix{Bool}
@@ -71,6 +75,13 @@ function _create_wkp_nc(file::AbstractString, wk::WindKP; compress::Int = 1)
     nccreate(file, "run_done", "wdir", nd, "wspd", nu; atts = Dict("long_name" => "1 when the run has been computed"), t = NC_INT)
     nccreate(file, "m0", dX, nx, dY, ny, "wdir", nd, "wspd", nu;
              atts = merge(fill0, Dict("long_name" => "wind-sea variance m0", "units" => "m2")), t = NC_FLOAT, compress = compress)
+    if _hasdir(wk)
+        for (v, ln) in (("mcos", "wind-sea sum of E cos(theta) (theta: mathematical, propagating-to)"),
+                        ("msin", "wind-sea sum of E sin(theta) (theta: mathematical, propagating-to)"))
+            nccreate(file, v, dX, nx, dY, ny, "wdir", nd, "wspd", nu; atts = merge(fill0, Dict("long_name" => ln, "units" => "m2")),
+                     t = NC_FLOAT, compress = compress)
+        end
+    end
     if np > 0
         nccreate(file, "point_i", "point", np; t = NC_INT); nccreate(file, "point_j", "point", np; t = NC_INT)
         nccreate(file, "spec", "freq", ns, "dir", nth, "point", np, "wdir", nd, "wspd", nu;
@@ -96,6 +107,10 @@ function _write_runs!(file::AbstractString, wk::WindKP, idx)
     nx, ny, ns, nth, np = size(wk.m0, 3), size(wk.m0, 4), length(wk.sig), round(Int, 2π / wk.dth), length(wk.points)
     for (a, b) in idx
         ncwrite(reshape(wk.m0[a, b, :, :], nx, ny, 1, 1), file, "m0"; start = [1, 1, a, b], count = [nx, ny, 1, 1])
+        if _hasdir(wk)
+            ncwrite(reshape(wk.mc[a, b, :, :], nx, ny, 1, 1), file, "mcos"; start = [1, 1, a, b], count = [nx, ny, 1, 1])
+            ncwrite(reshape(wk.ms[a, b, :, :], nx, ny, 1, 1), file, "msin"; start = [1, 1, a, b], count = [nx, ny, 1, 1])
+        end
         np > 0 && ncwrite(reshape(wk.spec[a, b, :, :, :], ns, nth, np, 1, 1), file, "spec";
                           start = [1, 1, 1, a, b], count = [ns, nth, np, 1, 1])
         ncwrite(reshape(Int32[wk.done[a, b]], 1, 1), file, "run_done"; start = [a, b], count = [1, 1])
@@ -130,6 +145,9 @@ function load_wind_kp_netcdf(file::AbstractString)
     nd, nu = length(dirs), length(speeds)
     done = reshape(Int.(rd("run_done")), nd, nu) .== 1
     m0 = permutedims(Float32.(rd("m0")), (3, 4, 1, 2))
+    hasdir = NetCDF.open(file) do nc_; haskey(nc_.vars, "mcos"); end
+    mc = hasdir ? permutedims(Float32.(rd("mcos")), (3, 4, 1, 2)) : zeros(Float32, nd, nu, 0, 0)
+    ms = hasdir ? permutedims(Float32.(rd("msin")), (3, 4, 1, 2)) : zeros(Float32, nd, nu, 0, 0)
     haspts = NetCDF.open(file) do nc_; haskey(nc_.vars, "spec"); end
     if haspts
         pts = [(Int(a), Int(b)) for (a, b) in zip(rd("point_i"), rd("point_j"))]
@@ -141,13 +159,13 @@ function load_wind_kp_netcdf(file::AbstractString)
     info = Dict{String,Any}("seconds" => Float64(get(ga, "seconds", 0.0)), "whitecap" => get(ga, "whitecap", 1) != 0,
                             "breaking" => get(ga, "breaking", 0) != 0, "friction" => get(ga, "friction", 0) != 0)
     mr === nothing || (info["mesh"] = mr[1])
-    wk = WindKP(x, y, depth, sig, dsig, sigf, dth, dirs, speeds, m0, pts, spec, done, info)
+    wk = WindKP(x, y, depth, sig, dsig, sigf, dth, dirs, speeds, m0, mc, ms, pts, spec, done, info)
     all(done) || @warn "$file holds $(count(done))/$(length(done)) wind runs; finish it with build_wind_kp(...; checkpoint=\"$file\")"
     return wk
 end
 
 function _check_compatible(old::WindKP, new::WindKP, file)
-    ok = size(old.m0) == size(new.m0) && size(old.spec) == size(new.spec) && old.dth ≈ new.dth && old.sig ≈ new.sig &&
+    ok = size(old.m0) == size(new.m0) && size(old.mc) == size(new.mc) && size(old.spec) == size(new.spec) && old.dth ≈ new.dth && old.sig ≈ new.sig &&
          old.dirs ≈ new.dirs && old.speeds ≈ new.speeds && old.points == new.points && old.x ≈ new.x && old.y ≈ new.y &&
          old.depth ≈ new.depth
     ok || error("checkpoint $file was made with a different grid, depth, spectral grid, wind directions / speeds or points; " *
@@ -203,13 +221,13 @@ function build_wind_kp(m::Union{WaveModel,BlockModel}; dirs = 0:22.5:337.5, spee
     _meshinfo!(info, m)
     xg, yg = _coords(m)
     wk = WindKP(xg, yg, copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, dirv, spdv,
-                zeros(Float32, nd, nu, nx, ny), collect(points), zeros(Float32, nd, nu, ns, nth, npt), fill(false, nd, nu), info)
+                zeros(Float32, nd, nu, nx, ny), zeros(Float32, nd, nu, nx, ny), zeros(Float32, nd, nu, nx, ny), collect(points), zeros(Float32, nd, nu, ns, nth, npt), fill(false, nd, nu), info)
     t_prev = 0.0
     if checkpoint !== nothing
         if resume && isfile(checkpoint)
             old = load_wind_kp_netcdf(checkpoint)
             _check_compatible(old, wk, checkpoint)
-            wk.m0 .= old.m0; wk.spec .= old.spec; wk.done .= old.done
+            wk.m0 .= old.m0; wk.mc .= old.mc; wk.ms .= old.ms; wk.spec .= old.spec; wk.done .= old.done
             t_prev = Float64(get(old.info, "seconds", 0.0))
             verbose && @printf("  resuming from %s: %d/%d wind runs already done\n", checkpoint, count(wk.done), nd * nu)
         else
@@ -234,7 +252,7 @@ function build_wind_kp(m::Union{WaveModel,BlockModel}; dirs = 0:22.5:337.5, spee
             set_wind!(m; U10 = spdv[b], dir = dirv[a])
             it, conv = solve_stationary!(m; sweep = sweep, verbose = false)
             conv || @warn @sprintf("wind run (%.1f°, %.1f m/s) did not converge in %d iterations", dirv[a], spdv[b], it)
-            _m0!(view(wk.m0, a, b, :, :), m, 1.0)
+            _moments!(view(wk.m0, a, b, :, :), view(wk.mc, a, b, :, :), view(wk.ms, a, b, :, :), m, 1.0)
             for (q, pt) in enumerate(points)
                 _binvar!(view(wk.spec, a, b, :, :, q), m, pt, 1.0)
             end
@@ -313,10 +331,15 @@ function _wind_weights(wk::WindKP, U::Real, d::Real, interp::Symbol)
 end
 
 """
-    wind_sea(wk, U10, dir; fields = true, interp = :loglog, umin = 1.0) -> (; m0, Hs, point_var)
+    wind_sea(wk, U10, dir; fields = true, interp = :loglog, umin = 1.0) -> (; m0, Hs, mc, ms, Dir, Spread, point_var)
 
 Wind-sea prediction for a time series of uniform local wind: `U10[t]` (m/s) and `dir[t]` (nautical, coming from, degrees).
 * `m0`, `Hs`   (nx, ny, nt) wind-sea variance (m²) and significant wave height (only if `fields = true`)
+* `mc`, `ms`   (nx, ny, nt) wind-sea direction vector (Σ E cos θ, Σ E sin θ; m²), and from it `Dir` (mean direction, nautical
+               from, degrees) and `Spread` (directional spread, degrees) of the wind sea. In speed, the normalised vector
+               (mc, ms) / m0 of each trained direction is interpolated linearly between the bracketing speeds and scaled by
+               that direction's interpolated m0; the two bracketing directions are then combined with the same weights as m0.
+               Empty (0, 0, 0) for tables without direction moments.
 * `point_var`  (nt, ns, nth, npoints) wind-sea variance per model spectral bin at the stored points
 * `interp`     `:loglog` (default; m0 follows a power law of U between trained speeds — fetch-limited growth is close to
                Hs ∝ U, fully developed to Hs ∝ U²) or `:linear`. Outside the trained speeds the end segment is extrapolated
@@ -333,6 +356,9 @@ function wind_sea(wk::WindKP, U10::AbstractVector, dir::AbstractVector; fields::
     nx, ny = size(wk.m0, 3), size(wk.m0, 4)
     ns, nth, np = size(wk.spec, 3), size(wk.spec, 4), size(wk.spec, 5)
     m0 = fields ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
+    dodir = fields && _hasdir(wk)
+    mc = dodir ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
+    ms = dodir ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
     pv = zeros(nt, ns, nth, np)
     single = length(wk.speeds) == 1
     for t in 1:nt
@@ -341,14 +367,20 @@ function wind_sea(wk::WindKP, U10::AbstractVector, dir::AbstractVector; fields::
         a1, a2, wd, k1, k2, s = _wind_weights(wk, U, dir[t], interp)
         u1, u2 = wk.speeds[k1], wk.speeds[k2]
         val(v1, v2) = single ? v1 * (U / u1)^2 : _speed_value(v1, v2, s, U, u1, u2, interp)
+        sl = clamp(s, 0.0, 1.0)
         if fields
             @inbounds for j in 1:ny, i in 1:nx
                 va = val(Float64(wk.m0[a1, k1, i, j]), Float64(wk.m0[a1, k2, i, j]))
                 vb = val(Float64(wk.m0[a2, k1, i, j]), Float64(wk.m0[a2, k2, i, j]))
                 m0[i, j, t] = (1 - wd) * va + wd * vb
+                if dodir
+                    ca, sa = _unitvec(wk, a1, k1, k2, sl, i, j)
+                    cb, sb = _unitvec(wk, a2, k1, k2, sl, i, j)
+                    mc[i, j, t] = (1 - wd) * va * ca + wd * vb * cb
+                    ms[i, j, t] = (1 - wd) * va * sa + wd * vb * sb
+                end
             end
         end
-        sl = clamp(s, 0.0, 1.0)
         for q in 1:np, (a, w) in ((a1, 1 - wd), (a2, wd))
             w == 0 && continue
             S1 = @view wk.spec[a, k1, :, :, q]; S2 = @view wk.spec[a, k2, :, :, q]
@@ -363,7 +395,23 @@ function wind_sea(wk::WindKP, U10::AbstractVector, dir::AbstractVector; fields::
         end
     end
     Hs = fields ? 4 .* sqrt.(max.(m0, 0f0)) : zeros(Float32, 0, 0, 0)
-    return (; m0, Hs, point_var = pv)
+    Dir = similar(mc); Spread = similar(mc)
+    for c in eachindex(mc)
+        Dir[c], Spread[c] = _dir_spread(m0[c], mc[c], ms[c])
+    end
+    return (; m0, Hs, mc, ms, Dir, Spread, point_var = pv)
+end
+
+_hasdir(wk::WindKP) = size(wk.mc, 3) > 0
+
+# normalised direction vector (mc, ms)/m0 of trained direction a, interpolated in speed (weight sl of speed k2)
+@inline function _unitvec(wk::WindKP, a, k1, k2, sl, i, j)
+    v1, v2 = Float64(wk.m0[a, k1, i, j]), Float64(wk.m0[a, k2, i, j])
+    c1 = v1 > 0 ? wk.mc[a, k1, i, j] / v1 : 0.0; s1 = v1 > 0 ? wk.ms[a, k1, i, j] / v1 : 0.0
+    c2 = v2 > 0 ? wk.mc[a, k2, i, j] / v2 : 0.0; s2 = v2 > 0 ? wk.ms[a, k2, i, j] / v2 : 0.0
+    v1 > 0 || (c1, s1 = c2, s2)                  # one of the two states has no energy here: use the other one
+    v2 > 0 || (c2, s2 = c1, s1)
+    return ((1 - sl) * c1 + sl * c2, (1 - sl) * s1 + sl * s2)
 end
 
 WaveBlocks.to_grid(wk::WindKP, v::AbstractArray, xg::AbstractVector, yg::AbstractVector; outside = NaN) =

@@ -16,7 +16,7 @@ close(w)
 
 # BinWaves reconstruction (any cell fields, last dimension = time)
 rec = reconstruct(kp, E, f, dir)
-save_fields_netcdf("rec.nc", kp, times; Hs = rec.Hs, layout = :finest)
+save_fields_netcdf("rec.nc", kp, times; Hs = rec.Hs, Dir = rec.Dir, Spread = rec.Spread, layout = :finest)
 ```
 
 ## Layouts on a block mesh
@@ -43,7 +43,7 @@ A regular grid always gives a single `(time, y, x)` layer.
 * **Fields:** `Hs` → `sea_surface_wave_significant_height` (m); `Tm`/`Tm01` →
   `sea_surface_wave_mean_period_from_variance_spectral_density_first_frequency_moment` (s); `Tp` →
   `sea_surface_wave_period_at_variance_spectral_density_maximum` (s); `Dir` → `sea_surface_wave_from_direction` (degree,
-  nautical "from"). `Sxx/Sxy/Syy` get a long name and units N m-1 (CF has no standard name for them). `depth` →
+  nautical "from"); `Spread` → `sea_surface_wave_directional_spread` (degree). `Sxx/Sxy/Syy` get a long name and units N m-1 (CF has no standard name for them). `depth` →
   `sea_floor_depth_below_sea_surface` (m). Other names get only a long name; add attributes with
   `attributes = Dict(:name => Dict("standard_name" => ..., "units" => ...))`.
 * **Coordinates:** `x`, `y` are `projection_x/y_coordinate` in metres. Pass `crs` (a Dict of CF grid-mapping attributes:

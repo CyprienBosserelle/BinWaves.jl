@@ -42,27 +42,51 @@ function _resolve_points(m::BlockModel, points)
     return out
 end
 
-"""Variance m0 (m²) of every cell times `scale` into `out` (fieldsize); dry cells get 0."""
-function _m0!(out::AbstractMatrix, m::WaveModel, scale)
+"""
+Variance m0 and the energy-weighted direction vector (Σ E cos θ, Σ E sin θ; θ mathematical, propagating-to) of every cell,
+times `scale`, into `m0`, `mc`, `ms` (fieldsize; `mc = ms = nothing` skips the direction moments). Dry cells get 0.
+"""
+function _moments!(m0::AbstractMatrix, mc, ms, m::WaveModel, scale)
     sp = m.spec
     for j in 1:m.grid.ny, i in 1:m.grid.nx
-        out[i, j] = m.env.wet[NGH+i, NGH+j] ? _cellm0(m, sp, NGH + i, NGH + j) * scale : 0.0
+        _cellmom!(m0, mc, ms, (i, j), m, sp, NGH + i, NGH + j, scale)
     end
-    return out
+    return m0
 end
-function _m0!(out::AbstractMatrix, m::BlockModel, scale)
+function _moments!(m0::AbstractMatrix, mc, ms, m::BlockModel, scale)
     sp, bs = m.spec, m.mesh.bs
     for (k, b) in enumerate(m.blocks), j in 1:bs, i in 1:bs
-        out[cell_index(m.mesh, k, i, j), 1] = b.env.wet[NGH+i, NGH+j] ? _cellm0(b, sp, NGH + i, NGH + j) * scale : 0.0
+        _cellmom!(m0, mc, ms, (cell_index(m.mesh, k, i, j), 1), b, sp, NGH + i, NGH + j, scale)
     end
-    return out
+    return m0
 end
-function _cellm0(b::WaveModel, sp, ig, jg)
-    s = 0.0
-    @inbounds for it in 1:sp.nth, is in 1:sp.ns
-        s += sp.sig[is] * b.N[is, it, ig, jg] * sp.dsig[is]
+@inline function _cellmom!(m0, mc, ms, I, b::WaveModel, sp, ig, jg, scale)
+    if !b.env.wet[ig, jg]
+        m0[I...] = 0; mc === nothing || (mc[I...] = 0; ms[I...] = 0)
+        return
     end
-    return s * sp.dth
+    s0 = 0.0; sc = 0.0; ss = 0.0
+    @inbounds for it in 1:sp.nth
+        e = 0.0
+        for is in 1:sp.ns
+            e += sp.sig[is] * b.N[is, it, ig, jg] * sp.dsig[is]
+        end
+        s0 += e; sc += e * sp.cth[it]; ss += e * sp.sth[it]
+    end
+    f = sp.dth * scale
+    m0[I...] = s0 * f
+    mc === nothing || (mc[I...] = sc * f; ms[I...] = ss * f)
+    return
+end
+
+"""
+Mean direction (nautical, coming from, degrees) and directional spread (degrees, σ = √(2(1 − r)), r = |(a, b)| / m0: the
+circular-moment definition of Kuik et al. 1988, as in SWAN's DSPR) from m0 and the direction vector (a, b). NaN without energy.
+"""
+@inline function _dir_spread(m0, a, b)
+    m0 > 1e-12 || return (NaN32, NaN32)
+    r = min(sqrt(a^2 + b^2) / m0, 1.0)
+    return (Float32(mod(270 - rad2deg(atan(b, a)), 360)), Float32(rad2deg(sqrt(2 * (1 - r)))))
 end
 
 """Variance per spectral bin (ns, nth) at a stored point, times `scale`."""
@@ -120,6 +144,8 @@ struct BinWavesKP
     cases::Vector{Tuple{Int,Int}}                # (frequency group, direction group) of each case
     Vin::Vector{Float64}                         # input variance of each case (m²)
     kp_m0::Array{Float32,3}                      # (ncase, nx, ny)  output m0 / input variance
+    kp_cos::Array{Float32,3}                     # (ncase, nx, ny)  output Σ E cos θ / input variance  (θ math, going to)
+    kp_sin::Array{Float32,3}                     # (ncase, nx, ny)  output Σ E sin θ / input variance;  both (ncase, 0, 0) if not stored
     points::Vector{Tuple{Int,Int}}
     kp_spec::Array{Float32,4}                    # (ncase, ns, nth, npoints) output variance per bin / input variance
     done::Vector{Bool}                           # which cases have been computed
@@ -127,7 +153,10 @@ struct BinWavesKP
 end
 Base.show(io::IO, k::BinWavesKP) = print(io, "BinWavesKP: ", count(k.done), "/", length(k.cases), " cases computed (", length(k.fgroups), " freq groups × ",
     length(k.dgroups), " dir groups), ", _hasmesh(k.info) ? "block mesh of $(size(k.kp_m0, 2)) cells" : "grid $(length(k.x))×$(length(k.y))",
-    ", ", length(k.points), " spectral points")
+    ", ", length(k.points), " spectral points", _hasdir(k) ? ", direction moments" : "")
+
+"""True when the coefficients include the direction moments (gridded mean direction and spread in `reconstruct`)."""
+_hasdir(k::BinWavesKP) = size(k.kp_cos, 2) > 0
 
 save_kp(file, kp::BinWavesKP) = serialize(file, kp)
 load_kp(file) = deserialize(file)
@@ -161,6 +190,13 @@ function _create_kp_nc(file::AbstractString, kp::BinWavesKP; compress::Int = 1)
     nccreate(file, "Vin", "case", nc; atts = Dict("units" => "m2", "long_name" => "input variance of the case"), t = NC_DOUBLE)
     nccreate(file, "kp_m0", dX, nx, dY, ny, "case", nc;
              atts = merge(fill0, Dict("long_name" => "output m0 / input variance", "units" => "1")), t = NC_FLOAT, compress = compress)
+    if _hasdir(kp)
+        for (v, ln) in (("kp_cos", "output sum of E cos(theta) / input variance (theta: mathematical, propagating-to)"),
+                        ("kp_sin", "output sum of E sin(theta) / input variance (theta: mathematical, propagating-to)"))
+            nccreate(file, v, dX, nx, dY, ny, "case", nc; atts = merge(fill0, Dict("long_name" => ln, "units" => "1")),
+                     t = NC_FLOAT, compress = compress)
+        end
+    end
     if np > 0
         nccreate(file, "point_i", "point", np; t = NC_INT); nccreate(file, "point_j", "point", np; t = NC_INT)
         nccreate(file, "kp_spec", "freq", ns, "dir", nth, "point", np, "case", nc;
@@ -195,6 +231,10 @@ function _write_cases!(file::AbstractString, kp::BinWavesKP, idx)
     nx, ny, ns, nth, np = size(kp.kp_m0, 2), size(kp.kp_m0, 3), length(kp.sig), _nth(kp), length(kp.points)
     for c in idx
         ncwrite(reshape(Float32.(kp.kp_m0[c, :, :]), nx, ny, 1), file, "kp_m0"; start = [1, 1, c], count = [nx, ny, 1])
+        if _hasdir(kp)
+            ncwrite(reshape(Float32.(kp.kp_cos[c, :, :]), nx, ny, 1), file, "kp_cos"; start = [1, 1, c], count = [nx, ny, 1])
+            ncwrite(reshape(Float32.(kp.kp_sin[c, :, :]), nx, ny, 1), file, "kp_sin"; start = [1, 1, c], count = [nx, ny, 1])
+        end
         np > 0 && ncwrite(reshape(Float32.(kp.kp_spec[c, :, :, :]), ns, nth, np, 1), file, "kp_spec";
                           start = [1, 1, 1, c], count = [ns, nth, np, 1])
         ncwrite([kp.Vin[c]], file, "Vin"; start = [c], count = [1])
@@ -207,7 +247,7 @@ end
     save_kp_netcdf(file, kp; compress = 1)
 
 Write a (complete or partial) `BinWavesKP` to a NetCDF file. Dimensions: x, y, freq, dir, point, case. File size is
-`4·ncase·(nx·ny + ns·nth·npoints)` bytes before compression.
+`4·ncase·(k·nx·ny + ns·nth·npoints)` bytes before compression (k = 3 with direction moments, 1 without).
 """
 function save_kp_netcdf(file::AbstractString, kp::BinWavesKP; compress::Int = 1)
     _create_kp_nc(file, kp; compress = compress)
@@ -235,6 +275,9 @@ function load_kp_netcdf(file::AbstractString)
     nc = length(cases)
     done = Int.(rd("case_done")) .== 1                 # unwritten entries carry the NetCDF fill value
     kp_m0 = permutedims(Float32.(rd("kp_m0")), (3, 1, 2))
+    hasdir = NetCDF.open(file) do nc_; haskey(nc_.vars, "kp_cos"); end       # files written before the direction moments: none
+    kp_cos = hasdir ? permutedims(Float32.(rd("kp_cos")), (3, 1, 2)) : zeros(Float32, nc, 0, 0)
+    kp_sin = hasdir ? permutedims(Float32.(rd("kp_sin")), (3, 1, 2)) : zeros(Float32, nc, 0, 0)
     haspts = NetCDF.open(file) do nc_; haskey(nc_.vars, "kp_spec"); end
     if haspts
         pts = [(Int(a), Int(b)) for (a, b) in zip(rd("point_i"), rd("point_j"))]
@@ -250,7 +293,7 @@ function load_kp_netcdf(file::AbstractString)
                             "wind" => get(ga, "wind", 0) != 0)
     mr === nothing || (info["mesh"] = mr[1])
     Vin = Float64.(rd("Vin")); Vin[.!done] .= 0.0
-    kp = BinWavesKP(x, y, depth, sig, dsig, sigf, dth, fg, dg, cases, Vin, kp_m0, pts, kp_spec, done, info)
+    kp = BinWavesKP(x, y, depth, sig, dsig, sigf, dth, fg, dg, cases, Vin, kp_m0, kp_cos, kp_sin, pts, kp_spec, done, info)
     all(kp.done) || @warn "$file holds $(count(done))/$nc cases; reconstruct will warn until build_kp(...; checkpoint=\"$file\") has finished the rest"
     return kp
 end
@@ -259,8 +302,9 @@ function _check_compatible(old::BinWavesKP, new::BinWavesKP, file)
     ok = length(old.x) == length(new.x) && length(old.y) == length(new.y) && length(old.sig) == length(new.sig) &&
          old.dth ≈ new.dth && old.sig ≈ new.sig && old.fgroups == new.fgroups && old.dgroups == new.dgroups &&
          old.cases == new.cases && old.points == new.points && old.x ≈ new.x && old.y ≈ new.y && old.depth ≈ new.depth &&
-         string.(old.info["sides"]) == string.(new.info["sides"])
-    ok || error("checkpoint $file was made with a different grid, depth, spectral grid, grouping, points or boundary sides; " *
+         string.(old.info["sides"]) == string.(new.info["sides"]) && _hasdir(old) == _hasdir(new)
+    ok || error("checkpoint $file was made with a different grid, depth, spectral grid, grouping, points, boundary sides or " *
+                "direction-moment setting (dir_moments); " *
                 "delete it or pass resume = false")
 end
 
@@ -289,10 +333,14 @@ they are; the model's own boundary conditions are restored afterwards).
             `resume = true` (default) the finished cases are read from it and skipped, so an interrupted build continues where
             it stopped. The file can be loaded with `load_kp_netcdf` at any time. Settings must match (error otherwise).
 * `cases`   optional vector of case numbers to compute (for testing / restarts); other cases stay zero.
+* `dir_moments`  also store, per case and cell, the energy-weighted direction vector (Σ E cos θ, Σ E sin θ) so that
+            `reconstruct` gives the mean wave direction and directional spread at every cell (default; 3× the field storage
+            of m0 alone). Like m0 it is linear in the spectrum, so the superposition is exact.
 """
 function build_kp(m::Union{WaveModel,BlockModel}; fgroup::Int = 1, dgroup::Int = 1, sides = (:left, :right, :bottom, :top),
                   hs_rule = T -> T > 5 ? 1.0 : 0.1, points = Tuple{Int,Int}[], sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0), verbose::Bool = true,
-                  cases = nothing, checkpoint = nothing, checkpoint_every::Int = 10, resume::Bool = true)
+                  cases = nothing, checkpoint = nothing, checkpoint_every::Int = 10, resume::Bool = true,
+                  dir_moments::Bool = true)
     sp = m.spec
     ns, nth = sp.ns, sp.nth
     nx, ny = _fieldsize(m)
@@ -306,6 +354,8 @@ function build_kp(m::Union{WaveModel,BlockModel}; fgroup::Int = 1, dgroup::Int =
     npt = length(points)
     Vin = zeros(nc)
     kp_m0 = zeros(Float32, nc, nx, ny)
+    kp_cos = dir_moments ? zeros(Float32, nc, nx, ny) : zeros(Float32, nc, 0, 0)
+    kp_sin = dir_moments ? zeros(Float32, nc, nx, ny) : zeros(Float32, nc, 0, 0)
     kp_spec = zeros(Float32, nc, ns, nth, npt)
     done = fill(false, nc)
     orig = m.bc
@@ -316,13 +366,13 @@ function build_kp(m::Union{WaveModel,BlockModel}; fgroup::Int = 1, dgroup::Int =
     _meshinfo!(info, m)
     xg, yg = _coords(m)
     kp = BinWavesKP(xg, yg, copy(D), copy(sp.sig), copy(sp.dsig), copy(sp.sigf), sp.dth, fgroups, dgroups, caselist,
-                    Vin, kp_m0, collect(points), kp_spec, done, info)
+                    Vin, kp_m0, kp_cos, kp_sin, collect(points), kp_spec, done, info)
     t_prev = 0.0
     if checkpoint !== nothing
         if resume && isfile(checkpoint)
             old = load_kp_netcdf(checkpoint)
             _check_compatible(old, kp, checkpoint)
-            Vin .= old.Vin; kp_m0 .= old.kp_m0; kp_spec .= old.kp_spec; done .= old.done
+            Vin .= old.Vin; kp_m0 .= old.kp_m0; kp_cos .= old.kp_cos; kp_sin .= old.kp_sin; kp_spec .= old.kp_spec; done .= old.done
             t_prev = Float64(get(old.info, "seconds", 0.0))
             verbose && @printf("  resuming from %s: %d/%d cases already done\n", checkpoint, count(done), nc)
         else
@@ -359,7 +409,11 @@ function build_kp(m::Union{WaveModel,BlockModel}; fgroup::Int = 1, dgroup::Int =
         swc = SweepParams(w_theta = sweep.w_theta, w_sigma = sweep.w_sigma, iters = sweep.iters, maxiter = sweep.maxiter,
                           drel = sweep.drel, dabs = sweep.dabs * Hs_in, npnts = sweep.npnts)
         solve_stationary!(m; sweep = swc, verbose = false)
-        _m0!(view(kp_m0, c, :, :), m, 1 / V)
+        if dir_moments
+            _moments!(view(kp_m0, c, :, :), view(kp_cos, c, :, :), view(kp_sin, c, :, :), m, 1 / V)
+        else
+            _moments!(view(kp_m0, c, :, :), nothing, nothing, m, 1 / V)
+        end
         for (p, pt) in enumerate(points)
             _binvar!(view(kp_spec, c, :, :, p), m, pt, 1 / V)
         end
@@ -437,11 +491,16 @@ end
 median_spacing(d) = (s = sort(collect(Float64, d)); sort(diff(s))[(1 + length(s) - 1) ÷ 2])
 
 """
-    reconstruct(kp, E, f, dir; fields = true, wind = nothing, U10 = nothing, wdir = nothing) -> (; Hs, point_var, V, captured[, wind])
+    reconstruct(kp, E, f, dir; fields = true, wind = nothing, U10 = nothing, wdir = nothing)
+        -> (; Hs, Dir, Spread, point_var, V, captured[, wind])
 
 Nearshore reconstruction for offshore spectra `E[t, f, dir]` (see `bin_offshore_spectrum`).
 * `Hs`         (nx, ny, nt) significant wave height (Float32; 0 on dry cells) — only if `fields = true`; on a block mesh
                (ncells, 1, nt): `to_grid(kp, rec.Hs, xg, yg)` samples it onto a regular grid
+* `Dir`        (nx, ny, nt) mean wave direction (nautical, coming from, degrees; NaN without energy): the direction of the
+               energy-weighted vector (Σ E cos θ, Σ E sin θ), as `bulk` defines it. Needs coefficients built with
+               `dir_moments = true` (the default); otherwise `Dir` and `Spread` are empty (0, 0, 0) arrays.
+* `Spread`     (nx, ny, nt) directional spread (degrees): √(2(1 − r)), r = |(Σ E cos θ, Σ E sin θ)| / m0 (Kuik et al. 1988)
 * `point_var`  (nt, ns, nth, npoints) variance (m²) per model spectral bin at the stored points
 * `V`          the case weights, `captured` the in-range fraction of the offshore variance
 * `depth_limit`  e.g. `0.73`: cap the gridded Hs at `depth_limit · depth` (use with coefficients built *without* breaking, see README)
@@ -468,14 +527,35 @@ function reconstruct(kp::BinWavesKP, E::AbstractArray{<:Real,3}, f::AbstractVect
         wind.points == kp.points || error("the wind table and the swell coefficients store spectra at different points")
         ws = wind_sea(wind, U10, wdir; fields = fields, interp = wind_interp, umin = umin)
     end
+    dodir = fields && _hasdir(kp)
+    if dodir && ws !== nothing && size(ws.mc, 1) == 0
+        @warn "the wind table has no direction moments (built before they were added): Dir and Spread are not reconstructed"
+        dodir = false
+    end
     Hs = fields ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
+    Dir = dodir ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
+    Spread = dodir ? zeros(Float32, nx, ny, nt) : zeros(Float32, 0, 0, 0)
     if fields
         K = reshape(kp.kp_m0, nc, nx * ny)
+        Kc = dodir ? reshape(kp.kp_cos, nc, nx * ny) : K
+        Ks = dodir ? reshape(kp.kp_sin, nc, nx * ny) : K
         for t0 in 1:tchunk:nt
             r = t0:min(nt, t0 + tchunk - 1)
-            m0 = Float32.(V[r, :]) * K                                         # (chunk × cells)
+            Vr = Float32.(V[r, :])
+            m0 = Vr * K                                                        # (chunk × cells)
             ws === nothing || (m0 .+= permutedims(reshape(ws.m0[:, :, r], nx * ny, length(r))))
             Hs[:, :, r] .= reshape(permutedims(4 .* sqrt.(max.(m0, 0f0))), nx, ny, length(r))
+            if dodir
+                A = Vr * Kc; B = Vr * Ks
+                if ws !== nothing
+                    A .+= permutedims(reshape(ws.mc[:, :, r], nx * ny, length(r)))
+                    B .+= permutedims(reshape(ws.ms[:, :, r], nx * ny, length(r)))
+                end
+                for (q, k) in enumerate(r), c in 1:nx * ny
+                    d, sp_ = _dir_spread(m0[q, c], A[q, c], B[q, c])
+                    Dir[c + (k - 1) * nx * ny] = d; Spread[c + (k - 1) * nx * ny] = sp_
+                end
+            end
             if depth_limit !== nothing            # crude surf-zone cap: Hs ≤ γ d
                 cap = Float32.(depth_limit .* kp.depth)
                 for k in r; @views Hs[:, :, k] .= min.(Hs[:, :, k], cap); end
@@ -484,9 +564,9 @@ function reconstruct(kp::BinWavesKP, E::AbstractArray{<:Real,3}, f::AbstractVect
     end
     ns, nth, np = size(kp.kp_spec, 2), size(kp.kp_spec, 3), size(kp.kp_spec, 4)
     pv = np == 0 ? zeros(nt, ns, nth, 0) : reshape(V * reshape(Float64.(kp.kp_spec), nc, ns * nth * np), nt, ns, nth, np)
-    ws === nothing && return (; Hs, point_var = pv, V, captured)
+    ws === nothing && return (; Hs, Dir, Spread, point_var = pv, V, captured)
     pv .+= ws.point_var
-    return (; Hs, point_var = pv, V, captured, wind = ws)
+    return (; Hs, Dir, Spread, point_var = pv, V, captured, wind = ws)
 end
 
 """

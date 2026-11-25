@@ -17,7 +17,10 @@ wind direction, so it cannot be another set of superposed cases. It is handled b
      m0 ∝ U⁴; `:linear` goes to zero at U = 0 below the lowest speed). Below `umin` (1 m/s) there is no wind sea.
    * point spectra: the bracketing spectra are blended and rescaled to the interpolated variance.
 3. **Combination**: the wind sea is added as variance, `Hs² = Hs²_swell + Hs²_wind`, and the point spectra are summed
-   (`point_parameters` works on the total or on `rec.wind.point_var` alone).
+   (`point_parameters` works on the total or on `rec.wind.point_var` alone). The direction vectors (Σ E cos θ, Σ E sin θ)
+   are added too, so `rec.Dir` and `rec.Spread` describe the combined sea state. For the wind sea alone the vector is
+   interpolated in speed as a normalised vector and scaled by the interpolated m0. In the test, the combined mean
+   direction is within 0.67° RMS of a coupled direct run (2.3° if the wind sea is ignored).
 
 ```julia
 wk  = build_wind_kp(model; dirs = 0:22.5:337.5, speeds = [5, 10, 15, 20, 25, 30], points = pts,

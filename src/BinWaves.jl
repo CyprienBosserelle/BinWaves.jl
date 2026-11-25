@@ -29,6 +29,7 @@ Differences from the paper's set-up (all by design, to suit this model):
     kp = build_kp(model; points = [(40, 20)], sides = (:left, :bottom))        # slow part, once
     rec = reconstruct(kp, E, f_hz, dir_nautical_from_deg)                       # fast part, per offshore time series
     rec.Hs                 # (nx, ny, nt) nearshore Hs
+    rec.Dir, rec.Spread    # (nx, ny, nt) mean direction (nautical from) and directional spread, degrees
 
     # long builds: checkpoint to NetCDF, resume after an interruption, reuse later without rebuilding
     kp = build_kp(model; points = pts, checkpoint = "kp.nc")       # re-running the same call resumes from kp.nc

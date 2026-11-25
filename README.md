@@ -34,6 +34,7 @@ solve_stationary!(model)
 
 kp  = build_kp(model; points = [(40, 20)], sides = (:left,))   # slow part, once
 rec = reconstruct(kp, E, f_hz, dir_nautical_from_deg)          # fast part, per offshore time series
+rec.Hs, rec.Dir, rec.Spread                                     # Hs, mean direction and directional spread at every cell
 ```
 Block-adaptive mesh (coarse in deep water, fine in the shallows; see `docs/README_Blocks.md`):
 ```julia

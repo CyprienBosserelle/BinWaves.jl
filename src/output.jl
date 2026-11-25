@@ -10,6 +10,7 @@ const _CF = Dict{Symbol,Dict{String,Any}}(
     :Tp  => Dict("standard_name" => "sea_surface_wave_period_at_variance_spectral_density_maximum", "long_name" => "peak wave period", "units" => "s"),
     :Dir => Dict("standard_name" => "sea_surface_wave_from_direction", "long_name" => "mean wave direction (coming from, clockwise from north)",
                  "units" => "degree"),
+    :Spread => Dict("standard_name" => "sea_surface_wave_directional_spread", "long_name" => "directional spread", "units" => "degree"),
     :Sxx => Dict("long_name" => "radiation stress, xx component", "units" => "N m-1"),
     :Sxy => Dict("long_name" => "radiation stress, xy component", "units" => "N m-1"),
     :Syy => Dict("long_name" => "radiation stress, yy component", "units" => "N m-1"),

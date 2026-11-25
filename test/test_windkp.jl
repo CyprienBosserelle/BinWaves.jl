@@ -17,13 +17,24 @@ end
 
 wetcells(m) = m.env.wet[WaveAction.NG+1:WaveAction.NG+m.grid.nx, WaveAction.NG+1:WaveAction.NG+m.grid.ny]
 
-function direct_wind(m, U, d; sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0, dabs = 1e-4, maxiter = 200), bcleft = ZeroBC())
+# circular difference (degrees)
+cdiff(a, b) = abs(mod(a - b + 180, 360) - 180)
+# direction spread of every cell of a model (same definition as reconstruct)
+function model_spread(m)
+    nx, ny = m.grid.nx, m.grid.ny
+    m0 = zeros(nx, ny); a = zeros(nx, ny); b = zeros(nx, ny)
+    BinWaves._moments!(m0, a, b, m, 1.0)
+    return reshape([BinWaves._dir_spread(m0[c], a[c], b[c])[2] for c in eachindex(m0)], size(m0))
+end
+
+function direct_wind(m, U, d; sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0, dabs = 1e-4, maxiter = 200), bcleft = ZeroBC(),
+                     model = false)
     m.params = BinWaves._with(m.params; wind = true, whitecap = true)
     set_boundaries!(m; left = bcleft, right = ZeroBC(), bottom = ZeroBC(), top = ZeroBC())
     initialize!(m; Hs = 0.0)
     set_wind!(m; U10 = U, dir = d)
     solve_stationary!(m; sweep = sweep, verbose = false)
-    return bulk(m).Hs
+    return model ? m : bulk(m).Hs
 end
 
 rmsrel(a, b, mask) = sqrt(sum(((a .- b) .^ 2)[mask]) / sum((b .^ 2)[mask]))
@@ -88,7 +99,7 @@ rmsrel(a, b, mask) = sqrt(sum(((a .- b) .^ 2)[mask]) / sum((b .^ 2)[mask]))
         f = joinpath(dir, "wind.nc")
         save_wind_kp_netcdf(f, wk)
         w2 = load_wind_kp_netcdf(f)
-        @test w2.m0 == wk.m0 && w2.spec == wk.spec && w2.done == wk.done && w2.dirs == wk.dirs && w2.speeds == wk.speeds
+        @test w2.m0 == wk.m0 && w2.mc == wk.mc && w2.ms == wk.ms && w2.spec == wk.spec && w2.done == wk.done && w2.dirs == wk.dirs && w2.speeds == wk.speeds
         @test w2.points == wk.points
         ck = joinpath(dir, "ck.nc")
         mc = bay_model()
@@ -124,17 +135,35 @@ rmsrel(a, b, mask) = sqrt(sum(((a .- b) .^ 2)[mask]) / sum((b .^ 2)[mask]))
             is, it = only(kp.fgroups[a]), only(kp.dgroups[h])
             Nb[is, it] = V[1, c] / (sp.sig[is] * sp.dsig[is] * sp.dth)
         end
-        Hsw = reconstruct(kp, E, f, dirs).Hs[:, :, 1]
-        Hsd = (mm = bay_model(); set_boundaries!(mm; left = SpectrumBC(Nb), right = ZeroBC(), bottom = ZeroBC(), top = ZeroBC());
-               initialize!(mm; Hs = 0.0); solve_stationary!(mm; sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0, dabs = 1e-4),
-               verbose = false); bulk(mm).Hs)
+        rsw = reconstruct(kp, E, f, dirs)
+        Hsw = rsw.Hs[:, :, 1]
+        mm = bay_model(); set_boundaries!(mm; left = SpectrumBC(Nb), right = ZeroBC(), bottom = ZeroBC(), top = ZeroBC())
+        initialize!(mm; Hs = 0.0); solve_stationary!(mm; sweep = SweepParams(w_theta = 0.0, w_sigma = 0.0, dabs = 1e-4), verbose = false)
+        bd = bulk(mm); Hsd = bd.Hs
+        # gridded direction and spread of the swell: the superposition is exact
+        msk = wet .& (Hsd .> 0.05)
+        edir = maximum(cdiff.(rsw.Dir[:, :, 1][msk], bd.Dir[msk])); espr = maximum(abs.(rsw.Spread[:, :, 1][msk] .- model_spread(mm)[msk]))
+        @printf("   swell direction at every cell vs direct run: max error %.2e°, spread %.2e°\n", edir, espr)
+        @test edir < 0.01 && espr < 0.01
+        @test all(isnan, rsw.Dir[:, :, 1][.!wet])
         rec = reconstruct(kp, E, f, dirs; wind = wk, U10 = [12.0], wdir = [250.0])
         Hw = wind_sea(wk, [12.0], [250.0]).Hs[:, :, 1]
         @test rec.Hs[:, :, 1] .^ 2 ≈ Hsw .^ 2 .+ Hw .^ 2 rtol = 1e-4
         @test rec.wind.m0[:, :, 1] ≈ Hw .^ 2 ./ 16
         @test rec.point_var[1, :, :, :] ≈ reconstruct(kp, E, f, dirs).point_var[1, :, :, :] .+ rec.wind.point_var[1, :, :, :]
-        Hc = direct_wind(bay_model(), 12.0, 250.0; bcleft = SpectrumBC(Nb))
+        mc_ = direct_wind(bay_model(), 12.0, 250.0; bcleft = SpectrumBC(Nb), model = true)
+        bc_ = bulk(mc_); Hc = bc_.Hs
         mask = wet .& (Hc .> 0.05)
+        ed = sqrt(sum(cdiff.(rec.Dir[:, :, 1][mask], bc_.Dir[mask]) .^ 2) / count(mask))
+        edsw = sqrt(sum(cdiff.(rsw.Dir[:, :, 1][mask], bc_.Dir[mask]) .^ 2) / count(mask))
+        es = sqrt(sum((rec.Spread[:, :, 1][mask] .- model_spread(mc_)[mask]) .^ 2) / count(mask))
+        @printf("   swell + wind sea direction vs coupled run: rms %.2f° (swell alone: %.2f°), spread rms %.2f°\n", ed, edsw, es)
+        @test ed < 5 && ed < edsw
+        @test es < 5
+        # the wind sea alone: a trained state's direction is the stored one
+        wt = wind_sea(wk, [16.0], [270.0])
+        @test all(cdiff.(wt.Dir[:, :, 1][wet .& (wt.Hs[:, :, 1] .> 0.05)], 
+                         [BinWaves._dir_spread(wk.m0[7, 3, c], wk.mc[7, 3, c], wk.ms[7, 3, c])[1] for c in findall(wet .& (wt.Hs[:, :, 1] .> 0.05))]) .< 1e-3)
         e_sw = rmsrel(Hsw, Hsd, mask)
         e_all = rmsrel(rec.Hs[:, :, 1], Hc, mask)
         @printf("   swell only: rms rel. error %.3f;   swell + wind sea (12 m/s, 250°) vs coupled direct run: %.3f\n", e_sw, e_all)

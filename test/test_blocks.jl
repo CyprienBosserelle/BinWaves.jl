@@ -1,6 +1,6 @@
 # Tests of the block-adaptive mesh (WaveBlocks) and of BinWaves on it.
 using BinWaves
-using Test, Printf
+using Test, Printf, NetCDF
 
 const NGb = WaveAction.NG
 
@@ -164,6 +164,28 @@ end
         e = sqrt(sum(((rec.Hs[:, 1, 1] .- Hd) .^ 2)[wet]) / sum((Hd .^ 2)[wet]))
         @printf("   superposition on the block mesh: rms relative Hs error %.2e\n", e)
         @test e < 0.01
+        # direction and spread at every mesh cell
+        bdir = bulk(bm).Dir
+        m0 = zeros(ncells(mesh), 1); a = zeros(ncells(mesh), 1); b = zeros(ncells(mesh), 1)
+        BinWaves._moments!(m0, a, b, bm, 1.0)
+        spr = [BinWaves._dir_spread(m0[c], a[c], b[c])[2] for c in 1:ncells(mesh)]
+        cd(x, y) = abs(mod(x - y + 180, 360) - 180)
+        ed = maximum(cd.(rec.Dir[wet, 1, 1], bdir[wet])); es = maximum(abs.(rec.Spread[wet, 1, 1] .- spr[wet]))
+        @printf("   direction on the block mesh: max error %.2e°, spread %.2e°\n", ed, es)
+        @test ed < 0.01 && es < 0.01
+        # CF output of the reconstructed direction (circular interpolation on the finest grid)
+        fo = joinpath(mktempdir(), "rec.nc")
+        save_fields_netcdf(fo, kp, [0.0]; layout = :both, Hs = rec.Hs, Dir = rec.Dir, Spread = rec.Spread)
+        @test ncgetatt(fo, "Spread", "standard_name") == "sea_surface_wave_directional_spread"
+        # coefficients without the direction moments: smaller, no Dir / Spread, files still load
+        kpn = build_kp(bm; sides = (:left,), points = pts, cases = use[1:2], verbose = false, dir_moments = false)
+        @test size(kpn.kp_cos) == (length(kpn.cases), 0, 0)
+        kpn.done .= true                                   # only two cases computed: silence the incomplete-build warnings
+        fn = joinpath(mktempdir(), "kpn.nc"); save_kp_netcdf(fn, kpn)
+        kpn2 = load_kp_netcdf(fn)
+        @test size(kpn2.kp_cos, 2) == 0
+        rn = reconstruct(kpn2, E, f, dirs)
+        @test size(rn.Dir) == (0, 0, 0) && size(rn.Hs) == (ncells(mesh), 1, 1)
         pp = point_parameters(kp, rec.point_var)
         for (q, (x, y)) in enumerate(pts)
             @test pp.Hs[1, q] ≈ Hd[cell_index(mesh, locate(mesh, x, y)...)] rtol = 0.01
@@ -173,7 +195,8 @@ end
         save_kp_netcdf(joinpath(dir, "kp.nc"), kp)
         kp2 = load_kp_netcdf(joinpath(dir, "kp.nc"))
         @test kp2.info["mesh"].level == mesh.level && kp2.info["mesh"].bx == mesh.bx && kp2.info["mesh"].by == mesh.by
-        @test kp2.x ≈ kp.x && kp2.y ≈ kp.y && kp2.kp_m0 == kp.kp_m0 && kp2.points == kp.points
+        @test kp2.x ≈ kp.x && kp2.y ≈ kp.y && kp2.kp_m0 == kp.kp_m0 && kp2.kp_cos == kp.kp_cos && kp2.kp_sin == kp.kp_sin &&
+              kp2.points == kp.points
         @test reconstruct(kp2, E, f, dirs).Hs ≈ rec.Hs
         G = to_grid(kp2, rec.Hs, [1000.0, 2600.0], [800.0, 700.0])
         @test G[1, 1] ≈ rec.Hs[cell_index(mesh, locate(mesh, 1000.0, 800.0)...), 1, 1]

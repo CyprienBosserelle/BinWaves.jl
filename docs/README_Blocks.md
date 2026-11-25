@@ -61,7 +61,8 @@ restored automatically.
 `build_kp` and `build_wind_kp` take a `BlockModel`. Give the output `points` as `(x, y)` coordinates. The coefficient
 fields are then `(ncase, ncells, 1)` arrays over the mesh cells, and the mesh is stored in `kp.info["mesh"]` and in the
 NetCDF files (dimension `cell`, with `cell_x`, `cell_y` and the block list). `reconstruct` returns `Hs` as `(ncells, 1, nt)`;
-`to_grid(kp, rec.Hs, xg, yg)` samples it onto a regular grid. Superposition is as exact as on a regular grid
+`to_grid(kp, rec.Hs, xg, yg)` samples it onto a regular grid. `rec.Dir` and `rec.Spread` (mean direction and directional
+spread) have the same shape. Superposition is as exact as on a regular grid
 (3.5e-7 relative error in the test).
 
 ## Limits
