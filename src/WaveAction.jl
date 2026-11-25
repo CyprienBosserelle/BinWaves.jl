@@ -35,7 +35,7 @@ module WaveAction
 
 using Base.Threads
 
-export CartesianGrid, SpectralGrid, WaveParams, WaveModel, SpectrumBC, OpenBC, ZeroBC
+export CartesianGrid, SpectralGrid, WaveParams, WaveModel, SpectrumBC, OpenBC, ZeroBC, ExternalBC
 export set_boundaries!, initialize!, set_environment!, update_environment!, set_wind!
 export GSEParams, set_gse!, gse_step!
 export step!, run!, stable_dt, bulk, total_action, jonswap, wavenumber, wavekin
@@ -210,6 +210,13 @@ struct OpenBC <: BoundaryCondition end
 No incoming waves (ghost cells hold zero action); outgoing waves leave freely. The SWAN default at open boundaries.
 """
 struct ZeroBC <: BoundaryCondition end
+"""
+    ExternalBC()
+
+Ghost cells are filled by the caller (e.g. from the neighbouring blocks of a block-adaptive mesh, see `WaveBlocks`);
+`apply_bc!` leaves them untouched.
+"""
+struct ExternalBC <: BoundaryCondition end
 """
     SpectrumBC(; Hs, Tp, dir, gamma=3.3, spread=10.0, scale=t->1.0)
     SpectrumBC(N::Matrix; scale=t->1.0)
@@ -463,20 +470,22 @@ end
 # Environment-derived fields (kinematics are precomputed: the time loop never solves the dispersion relation)
 # ------------------------------------------------------------------------------------------------
 """
-    update_environment!(m)
+    update_environment!(m; fill_ghosts = true)
 
 Recompute everything that depends only on depth/currents: wet mask, gradients, face group velocities, refraction
 and frequency-shift coefficients and the per-cell stable time step. Called automatically by the constructor and
 `set_environment!`.
 """
-function update_environment!(m::WaveModel)
+function update_environment!(m::WaveModel; fill_ghosts::Bool = true)
     m.gsec = nothing                      # face diffusivities of the GSE filter depend on the environment
     e, sp, p, gr = m.env, m.spec, m.params, m.grid
     nx, ny = gr.nx, gr.ny
     ns = sp.ns
     g, hmin = p.g, p.hmin
-    for A in (e.d, e.U, e.V, e.dddt)
-        fill_ghost!(A)
+    if fill_ghosts                        # false: the ghost depths / currents were set by the caller (block meshes)
+        for A in (e.d, e.U, e.V, e.dddt)
+            fill_ghost!(A)
+        end
     end
     @. e.wet = e.d > hmin
     # centred gradients (interior)
@@ -601,7 +610,9 @@ function apply_bc!(N::Array{Float64,4}, m::WaveModel, t)
     end
     # left / right over interior rows
     for (k, side) in ((1, :left), (2, :right))
-        if bc[k] isa SpectrumBC
+        if bc[k] isa ExternalBC
+            continue
+        elseif bc[k] isa SpectrumBC
             v = val(k)
             for j in 1:nyg, g in 1:NG
                 ig = side === :left ? g : nxg - g + 1
@@ -619,7 +630,9 @@ function apply_bc!(N::Array{Float64,4}, m::WaveModel, t)
         end
     end
     for (k, side) in ((3, :bottom), (4, :top))
-        if bc[k] isa SpectrumBC
+        if bc[k] isa ExternalBC
+            continue
+        elseif bc[k] isa SpectrumBC
             v = val(k)
             for i in 1:nxg, g in 1:NG
                 jg = side === :bottom ? g : nyg - g + 1
